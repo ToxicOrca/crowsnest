@@ -1,0 +1,43 @@
+[Unit]
+Description=Crowsnest ZFS storage agent (read-only pool status)
+Documentation=https://github.com/bthall/crowsnest/blob/main/docs/configuration.md
+Wants=network-online.target
+After=network-online.target zfs.target
+
+[Service]
+Type=simple
+User=crowsnest-storage
+Group=crowsnest-storage
+ExecStart=/usr/bin/python3 -I /opt/crowsnest-storage/crowsnest_storage.py --config /etc/crowsnest-storage/storage.json
+Restart=always
+RestartSec=30
+UMask=0077
+
+# Unprivileged read-only queries: no capabilities and no privilege escalation.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+# zpool/zfs talk to the kernel through /dev/zfs; every other device is denied.
+# /dev stays visible (no PrivateDevices) so by-id links can resolve to kernel names.
+DevicePolicy=closed
+DeviceAllow=/dev/zfs rw
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,565 @@
+"""Crowsnest ZFS storage agent: read-only pool status, outbound HTTPS only.
+
+Python 3.9+ standard library only. Runs read-only `zpool`/`zfs` queries and
+sends an allowlisted summary. Never transmits GUIDs, serial numbers,
+/dev/disk/by-id paths, physical paths, or ZFS status text, and never logs
+credentials.
+"""
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+AGENT_VERSION = '0.1.0'
+AGENT_PROTOCOL = 1
+DEFAULT_CONFIG = '/etc/crowsnest-storage/storage.json'
+INTERVAL = 60
+COMMAND_TIMEOUT = 20
+MAX_COMMAND_OUTPUT = 8 * 1024 * 1024
+MAX_REPORT_BYTES = 131072
+MAX_POOLS = 16
+MAX_VDEVS_PER_POOL = 128
+MAX_VDEV_DEPTH = 6
+MAX_DATASETS = 64
+MAX_NAME = 128
+MAX_DATASET_NAME = 256
+MAX_MOUNTPOINT = 256
+MIN_ZFS = (2, 3, 0)
+SAFE_PATH = '/usr/sbin:/usr/bin:/sbin:/bin'
+# Commands are fixed: no user-controlled arguments ever reach the shell-free argv.
+ZPOOL_STATUS = ('status', '-j', '--json-int')
+ZPOOL_LIST = ('list', '-j', '--json-int')
+ZFS_LIST = ('list', '-j', '--json-int', '-o', 'name,used,avail,refer,quota,mountpoint', '-d', '1')
+
+POOL_STATES = {'ONLINE', 'DEGRADED', 'FAULTED', 'OFFLINE', 'UNAVAIL', 'REMOVED', 'SUSPENDED'}
+VDEV_STATES = POOL_STATES | {'CANT_OPEN', 'CORRUPT_DATA', 'NO_REPLICAS', 'BAD_GUID_SUM', 'TOO_SMALL', 'BAD_LABEL', 'SPLIT'}
+GROUP_TYPES = {'root', 'mirror', 'raidz', 'draid', 'replacing', 'spare'}
+LEAF_TYPES = {'disk', 'file', 'dspare', 'indirect', 'hole', 'missing'}
+SCAN_TYPES = {'SCRUB': 'scrub', 'RESILVER': 'resilver', 'ERRORSCRUB': 'errorscrub'}
+SCAN_STATES = {'SCANNING': 'scanning', 'FINISHED': 'finished', 'CANCELED': 'canceled'}
+ERROR_CODES = {'zfs_unavailable', 'unsupported_version', 'permission_denied', 'command_failed',
+               'timeout', 'invalid_output', 'limit_exceeded', 'report_limit'}
+# Kernel block-device names ZFS itself reports (e.g. `sda`), with an optional
+# partition suffix to remove. dm-N is deliberately absent: it is renumbered
+# across reboots and multipath reloads, so it is never used as a name.
+KERNEL_NAME = re.compile(r'(?:(sd[a-z]+|vd[a-z]+|xvd[a-z]+|hd[a-z]+)[0-9]*'
+                         r'|(nvme[0-9]+n[0-9]+|mmcblk[0-9]+|md[0-9]+|loop[0-9]+|nbd[0-9]+|zd[0-9]+|rbd[0-9]+)(?:p[0-9]+)?)')
+DM_DEVICE = re.compile(r'dm-[0-9]+')
+NAME_SALT = re.compile(r'[0-9a-f]{64}')
+HASH_LENGTH = 8
+GROUP_NAME = re.compile(r'[a-z][a-z0-9]*(?::[a-z0-9]+)*-[0-9]{1,4}')
+SAFE_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,63}')
+POOL_NAME = re.compile(r'[A-Za-z][A-Za-z0-9_.:-]{0,127}')
+
+
+class AgentError(Exception):
+    """A collection failure reported to the dashboard as a fixed code only."""
+
+    def __init__(self, code, detail=''):
+        assert code in ERROR_CODES
+        super().__init__(code)
+        self.code = code
+        self.detail = detail
+
+
+def integer(value, maximum=2**64 - 1):
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= maximum:
+        raise AgentError('invalid_output', 'expected a non-negative integer')
+    return value
+
+
+def counter(node, key):
+    # Error counters are bounded to JavaScript's exact integer range.
+    return integer(node.get(key, 0), 9007199254740991)
+
+
+def byte_count(value):
+    return integer(value, 9007199254740991)
+
+
+def iso(seconds):
+    if seconds == 0:
+        return None
+    return datetime.fromtimestamp(integer(seconds, 253402300799), timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def kernel_name(value):
+    match = KERNEL_NAME.fullmatch(value or '')
+    return next((group for group in match.groups() if group), None) if match else None
+
+
+class DeviceNamer:
+    """Stable, private vdev names; alerts and history key on them.
+
+    Names survive reboots and dm-N renumbering: ZFS-reported kernel names,
+    group names and file basenames pass through; multipath members use their
+    multipath alias; anything else becomes <type>-<HMAC of its by-id name or
+    WWN>. The install-time salt keys the HMAC and is never sent or logged.
+    """
+
+    def __init__(self, salt, dev_root='/dev', sys_root='/sys'):
+        if not isinstance(salt, str) or not NAME_SALT.fullmatch(salt):
+            raise ValueError('Invalid name salt')
+        self._key = bytes.fromhex(salt)
+        self.dev_root, self.sys_root = dev_root, sys_root
+
+    def digest(self, identity, length=HASH_LENGTH):
+        return hmac.new(self._key, identity.encode('utf-8', 'surrogateescape'), hashlib.sha256).hexdigest()[:length]
+
+    def _sys(self, device, *parts):
+        try:
+            with open(os.path.join(self.sys_root, 'block', device, *parts), 'rb') as source:
+                return source.read(4097).decode('ascii').strip() or None
+        except (OSError, UnicodeDecodeError):
+            return None
+
+    def dm_device(self, node):
+        """dm-N behind a vdev, used only to look up its alias; never sent."""
+        for candidate in (node.get('name'), node.get('path')):
+            if not isinstance(candidate, str):
+                continue
+            if DM_DEVICE.fullmatch(candidate):
+                return candidate
+            if candidate.startswith('/dev/'):
+                try:
+                    target = os.path.basename(os.path.realpath(self.dev_root + candidate[4:]))
+                except (OSError, ValueError):
+                    continue
+                if DM_DEVICE.fullmatch(target):
+                    return target
+        return None
+
+    def multipath_alias(self, device):
+        uuid = self._sys(device, 'dm', 'uuid') or ''
+        if re.match(r'part[0-9]+-mpath-', uuid):
+            # A kpartx partition map: name the member by its parent multipath map.
+            try:
+                parents = os.listdir(os.path.join(self.sys_root, 'block', device, 'slaves'))
+            except OSError:
+                return None
+            if len(parents) != 1 or not DM_DEVICE.fullmatch(parents[0]):
+                return None
+            device, uuid = parents[0], self._sys(parents[0], 'dm', 'uuid') or ''
+        if not uuid.startswith('mpath-'):
+            return None
+        alias, wwid = self._sys(device, 'dm', 'name'), uuid[len('mpath-'):]
+        # Without user_friendly_names or an alias the map is named by its WWID: not an alias.
+        if not alias or not wwid or wwid in alias or DM_DEVICE.fullmatch(alias) or not SAFE_NAME.fullmatch(alias):
+            return None
+        return alias
+
+    def identity(self, node):
+        """Stable hash input: by-id name (often the WWN), dm UUID, or vdev GUID."""
+        devid, path = node.get('devid'), node.get('path')
+        if isinstance(devid, str) and devid:
+            return 'by-id:' + devid
+        if isinstance(path, str) and path.startswith('/dev/disk/by-id/') and len(path) > 16:
+            return 'by-id:' + path[16:]
+        device = self.dm_device(node)
+        uuid = self._sys(device, 'dm', 'uuid') if device else None
+        if uuid:
+            return 'dm-uuid:' + uuid
+        if isinstance(node.get('guid'), int) and not isinstance(node.get('guid'), bool):
+            return 'guid:' + str(node['guid'])
+        if isinstance(path, str) and path:
+            return 'path:' + path
+        raise AgentError('invalid_output', 'vdev has no stable identity')
+
+    def preferred(self, node, pool_name):
+        """A pass-through name, or None when the vdev must be named by hash."""
+        vtype, name = node.get('vdev_type'), node.get('name')
+        if vtype == 'root':
+            return pool_name
+        if vtype in GROUP_TYPES or vtype in ('indirect', 'hole', 'missing'):
+            return name if isinstance(name, str) and GROUP_NAME.fullmatch(name) else None
+        if vtype == 'file':
+            base = os.path.basename(name) if isinstance(name, str) else ''
+            return base if SAFE_NAME.fullmatch(base) else None
+        # By-id names are not resolved to sdX: kernel ordering is not stable either.
+        short = kernel_name(name)
+        if short:
+            return short
+        device = self.dm_device(node)
+        return self.multipath_alias(device) if device else None
+
+    def hashed(self, node, identity, length=HASH_LENGTH):
+        vtype = node.get('vdev_type')
+        label = vtype if vtype in GROUP_TYPES | LEAF_TYPES else 'device'
+        return label + '-' + self.digest(identity, length)
+
+    def name(self, node, pool_name, used):
+        """Unique within the pool: `used` maps each assigned name to its identity."""
+        preferred = self.preferred(node, pool_name)
+        if preferred and preferred not in used:
+            # A unique sentinel: any hashed name that collides with it is lengthened.
+            used[preferred] = object()
+            return preferred
+        identity = self.identity(node)
+        length = HASH_LENGTH
+        candidate = self.hashed(node, identity, length)
+        # Distinct disks never share a name: lengthen the hash on any collision.
+        while candidate in used and used[candidate] != identity:
+            if length >= 64:
+                raise AgentError('invalid_output', 'duplicate vdev identity')
+            length = min(64, length * 2)
+            candidate = self.hashed(node, identity, length)
+        if candidate in used:
+            raise AgentError('invalid_output', 'duplicate vdev identity')
+        used[candidate] = identity
+        return candidate
+
+
+def vdev_tree(node, pool_name, namer, depth=0, used=None):
+    """Allowlisted vdev tree. Names are unique within a pool (alerts key on them)."""
+    used = used if used is not None else {}
+    if not isinstance(node, dict):
+        raise AgentError('invalid_output', 'vdev is not an object')
+    if depth > MAX_VDEV_DEPTH:
+        raise AgentError('invalid_output', 'vdev tree too deep')
+    name = namer.name(node, pool_name, used)
+    vtype, state = node.get('vdev_type'), node.get('state')
+    result = {'name': name,
+              'type': vtype if vtype in GROUP_TYPES | LEAF_TYPES else 'unknown',
+              'state': state if state in VDEV_STATES else 'UNKNOWN',
+              'read': counter(node, 'read_errors'), 'write': counter(node, 'write_errors'),
+              'checksum': counter(node, 'checksum_errors')}
+    children = node.get('vdevs')
+    if children is not None:
+        if not isinstance(children, dict):
+            raise AgentError('invalid_output', 'vdev children are not an object')
+        result['children'] = [vdev_tree(child, pool_name, namer, depth + 1, used) for child in children.values()]
+    return result
+
+
+def walk(node):
+    yield node
+    for child in node.get('children', ()):
+        yield from walk(child)
+
+
+def attention(node):
+    return node['state'] != 'ONLINE' or node['read'] or node['write'] or node['checksum']
+
+
+def bounded_tree(root):
+    """Keep the tree within the cap without hiding an unhealthy or erroring vdev."""
+    if sum(1 for _ in walk(root)) <= MAX_VDEVS_PER_POOL:
+        return root, False
+
+    def prune(node, depth):
+        kept = [c for c in (prune(child, depth + 1) for child in node.get('children', ())) if c]
+        if depth > 1 and not kept and not attention(node):
+            return None
+        copy = {k: v for k, v in node.items() if k != 'children'}
+        if 'children' in node:
+            copy['children'] = kept
+        return copy
+
+    pruned = prune(root, 0)
+    if sum(1 for _ in walk(pruned)) > MAX_VDEVS_PER_POOL:
+        raise AgentError('limit_exceeded', 'too many vdevs need attention')
+    return pruned, True
+
+
+def scan_summary(stats):
+    """Latest scan only. A missing scan_stats means the pool was never scanned."""
+    if stats is None:
+        return None
+    if not isinstance(stats, dict):
+        raise AgentError('invalid_output', 'scan_stats is not an object')
+    function = stats.get('function')
+    if function in (None, 'NONE'):
+        return None
+    kind = SCAN_TYPES.get(function, 'other')
+    state = SCAN_STATES.get(stats.get('state'), 'unknown')
+    scan = {'type': kind, 'state': state, 'startTime': iso(stats.get('start_time', 0)),
+            'endTime': iso(stats.get('end_time', 0)) if state != 'scanning' else None,
+            'examinedBytes': byte_count(stats.get('examined', 0)),
+            'totalBytes': byte_count(stats.get('to_examine', 0)),
+            'errors': counter(stats, 'errors')}
+    # `processed` is bytes repaired by a scrub but bytes resilvered so far by a
+    # resilver; label it per scan type and never send one generic number.
+    if kind == 'scrub':
+        scan['repairedBytes'] = byte_count(stats.get('processed', 0))
+    elif kind == 'resilver':
+        scan['resilveredBytes'] = byte_count(stats.get('processed', 0))
+    return scan
+
+
+def list_property(properties, key):
+    value = (properties.get(key) or {}).get('value') if isinstance(properties, dict) else None
+    if value is None or value == '-':
+        return None
+    return byte_count(value)
+
+
+def pools_summary(status, listing, namer):
+    if not isinstance(status, dict) or not isinstance(status.get('pools', {}), dict):
+        raise AgentError('invalid_output', 'zpool status has no pools object')
+    if not isinstance(listing, dict) or not isinstance(listing.get('pools', {}), dict):
+        raise AgentError('invalid_output', 'zpool list has no pools object')
+    pools = status.get('pools', {})
+    if len(pools) > MAX_POOLS:
+        raise AgentError('limit_exceeded', 'too many pools')
+    listed = listing.get('pools', {})
+    result = []
+    for name, pool in pools.items():
+        if not isinstance(pool, dict) or not isinstance(name, str) or not POOL_NAME.fullmatch(name) or pool.get('name') != name:
+            raise AgentError('invalid_output', 'invalid pool entry')
+        roots = pool.get('vdevs')
+        if not isinstance(roots, dict) or len(roots) != 1:
+            raise AgentError('invalid_output', 'pool needs exactly one root vdev')
+        tree = vdev_tree(next(iter(roots.values())), name, namer)
+        nodes = list(walk(tree))
+        tree, truncated = bounded_tree(tree)
+        properties = (listed.get(name) or {}).get('properties')
+        capacity, fragmentation = list_property(properties, 'capacity'), list_property(properties, 'fragmentation')
+        state = pool.get('state')
+        result.append({
+            'name': name,
+            'state': state if state in POOL_STATES else 'UNKNOWN',
+            # Sizes are null if the pool appeared between the two commands.
+            'size': list_property(properties, 'size'),
+            'allocated': list_property(properties, 'allocated'),
+            'free': list_property(properties, 'free'),
+            'capacityPercent': capacity if capacity is None or capacity <= 100 else None,
+            'fragmentationPercent': fragmentation if fragmentation is None or fragmentation <= 100 else None,
+            # Totals are sums over every vdev in the full tree; error_count (permanent
+            # data errors) is separate and can be 0 while a vdev reports checksum errors.
+            'errors': {key: sum(n[key] for n in nodes) for key in ('read', 'write', 'checksum')},
+            'dataErrors': counter(pool, 'error_count'),
+            'scan': scan_summary(pool.get('scan_stats')),
+            'vdevs': [tree],
+            'vdevsTruncated': truncated,
+        })
+    return result
+
+
+def datasets_summary(listing):
+    if not isinstance(listing, dict) or not isinstance(listing.get('datasets', {}), dict):
+        raise AgentError('invalid_output', 'zfs list has no datasets object')
+    items = list(listing.get('datasets', {}).items())
+    result = []
+    for name, dataset in items[:MAX_DATASETS]:
+        properties = dataset.get('properties') if isinstance(dataset, dict) else None
+        if (not isinstance(name, str) or not 0 < len(name) <= MAX_DATASET_NAME or not name.isprintable()
+                or not isinstance(properties, dict)):
+            raise AgentError('invalid_output', 'invalid dataset entry')
+        mountpoint = (properties.get('mountpoint') or {}).get('value')
+        if mountpoint == '-' or mountpoint is None:
+            mountpoint = None
+        elif not isinstance(mountpoint, str) or len(mountpoint) > MAX_MOUNTPOINT or not mountpoint.isprintable():
+            raise AgentError('invalid_output', 'invalid mountpoint')
+        quota = list_property(properties, 'quota')
+        result.append({'name': name, 'used': list_property(properties, 'used'),
+                       'available': list_property(properties, 'available'),
+                       'referenced': list_property(properties, 'referenced'),
+                       'quota': quota or None, 'mountpoint': mountpoint})
+    return result, len(items) > MAX_DATASETS
+
+
+def find_command(name):
+    for directory in SAFE_PATH.split(':'):
+        candidate = os.path.join(directory, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    raise AgentError('zfs_unavailable', name + ' not found')
+
+
+def run_command(program, arguments):
+    """Run a fixed read-only query with a clean environment, a timeout and an output cap."""
+    try:
+        completed = subprocess.run([find_command(program), *arguments], stdin=subprocess.DEVNULL,
+                                   capture_output=True, timeout=COMMAND_TIMEOUT, check=False,
+                                   env={'PATH': SAFE_PATH, 'LC_ALL': 'C'})
+    except subprocess.TimeoutExpired as error:
+        raise AgentError('timeout', program + ' timed out') from error
+    except OSError as error:
+        raise AgentError('zfs_unavailable', type(error).__name__) from error
+    if len(completed.stdout) > MAX_COMMAND_OUTPUT:
+        raise AgentError('invalid_output', program + ' output exceeds limit')
+    if completed.returncode != 0:
+        message = completed.stderr.decode('utf-8', 'replace')
+        if re.search(r'invalid option|unrecognized option|unknown option', message, re.I):
+            raise AgentError('unsupported_version', program + ' does not support JSON output')
+        if re.search(r'permission denied|not permitted', message, re.I):
+            raise AgentError('permission_denied', program + ' permission denied')
+        raise AgentError('command_failed', program + ' exited with ' + str(completed.returncode))
+    return completed.stdout
+
+
+def run_json(program, arguments):
+    try:
+        return json.loads(run_command(program, arguments))
+    except (ValueError, UnicodeDecodeError) as error:
+        raise AgentError('invalid_output', program + ' returned invalid JSON') from error
+
+
+def zfs_version(run=run_command):
+    """Userland OpenZFS version; JSON output requires 2.3.0 or newer."""
+    first = run('zpool', ('--version',)).decode('utf-8', 'replace').splitlines()[:1]
+    match = re.fullmatch(r'zfs-([0-9]+)\.([0-9]+)\.([0-9]+)([A-Za-z0-9._+~-]{0,40})', first[0].strip() if first else '')
+    if not match:
+        raise AgentError('unsupported_version', 'unrecognized zpool --version output')
+    version = match.group(1) + '.' + match.group(2) + '.' + match.group(3) + match.group(4)
+    if tuple(int(match.group(i)) for i in (1, 2, 3)) < MIN_ZFS:
+        raise AgentError('unsupported_version', 'OpenZFS ' + version + ' lacks JSON output')
+    return version
+
+
+def collect(config, run=None, run_json_command=None, namer=None):
+    """Build the `storage` section; failures become a clear error state, never text parsing."""
+    # Resolve defaults at call time so one patched runner reaches every query.
+    run, run_json_command = run or run_command, run_json_command or run_json
+    # --check runs without configuration; its throwaway salt only affects names it never sends.
+    namer = namer or DeviceNamer(config.get('nameSalt') or secrets.token_hex(32))
+    storage = {'state': 'ok', 'error': None, 'zfsVersion': None, 'pools': [], 'datasetsStatus': 'disabled'}
+    try:
+        storage['zfsVersion'] = zfs_version(run)
+        status = run_json_command('zpool', ZPOOL_STATUS)
+        listing = run_json_command('zpool', ZPOOL_LIST)
+        storage['pools'] = pools_summary(status, listing, namer)
+    except AgentError as error:
+        return {**storage, 'state': 'error', 'error': error.code, 'pools': []}, error
+    if config.get('datasets', True):
+        # Optional dataset usage must never prevent pool status.
+        try:
+            datasets, truncated = datasets_summary(run_json_command('zfs', ZFS_LIST))
+            storage['datasets'] = datasets
+            storage['datasetsStatus'] = 'truncated' if truncated else 'complete'
+        except AgentError:
+            storage['datasetsStatus'] = 'unavailable'
+    return storage, None
+
+
+def encode_report(storage):
+    report = {'agentVersion': AGENT_VERSION, 'agentProtocol': AGENT_PROTOCOL, 'storage': storage}
+    body = json.dumps(report, separators=(',', ':')).encode()
+    if len(body) > MAX_REPORT_BYTES and 'datasets' in storage:
+        storage = {k: v for k, v in storage.items() if k != 'datasets'}
+        storage['datasetsStatus'] = 'report_limit'
+        return encode_report(storage)
+    if len(body) > MAX_REPORT_BYTES:
+        storage = {'state': 'error', 'error': 'report_limit', 'zfsVersion': storage.get('zfsVersion'),
+                   'pools': [], 'datasetsStatus': storage.get('datasetsStatus', 'disabled')}
+        return encode_report(storage)
+    return body, report
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, message, headers, new_url):
+        return None
+
+
+def check_config(config):
+    """Standalone dashboards only: an HTTPS origin, a host ID, a per-host token and the local name salt."""
+    if not isinstance(config, dict) or set(config) - {'url', 'hostId', 'hostToken', 'nameSalt', 'datasets'}:
+        raise ValueError('Invalid storage agent configuration')
+    url = urllib.parse.urlsplit(config.get('url') if isinstance(config.get('url'), str) else '')
+    url.port  # Raises ValueError for an invalid port.
+    if (url.scheme != 'https' or not url.hostname or url.username or url.password
+            or url.path not in ('', '/') or url.query or url.fragment
+            or not isinstance(config.get('hostId'), str)
+            or not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}', config['hostId'])):
+        raise ValueError('Invalid dashboard destination')
+    if not isinstance(config.get('hostToken'), str) or not re.fullmatch(r'[\x21-\x7e]{1,8192}', config['hostToken']):
+        raise ValueError('Invalid reporting credentials')
+    # Generated on this host at install; never sent to the dashboard.
+    if not isinstance(config.get('nameSalt'), str) or not NAME_SALT.fullmatch(config['nameSalt']):
+        raise ValueError('Invalid or missing name salt; rerun setup or restore storage.json')
+    if 'datasets' in config and not isinstance(config['datasets'], bool):
+        raise ValueError('Invalid storage agent configuration')
+    return config['url'].rstrip('/') + '/api/ingest/' + config['hostId']
+
+
+def read_limited(response, limit):
+    body = response.read(limit + 1)
+    if len(body) > limit:
+        raise ValueError('Response exceeds limit')
+    return json.loads(body)
+
+
+def deliver(config, opener, body):
+    request = urllib.request.Request(check_config(config), data=body, method='POST', headers={
+        'Content-Type': 'application/json', 'Authorization': 'Bearer ' + config['hostToken']})
+    with opener.open(request, timeout=20) as response:
+        acknowledgement = read_limited(response, 8192)
+        if response.status != 200 or not isinstance(acknowledgement, dict) or acknowledgement.get('ok') is not True:
+            raise ValueError('Report was not accepted')
+
+
+def load_config(path):
+    with open(path, 'rb') as source:
+        raw = source.read(65537)
+    if len(raw) > 65536:
+        raise ValueError('Configuration file is too large')
+    config = json.loads(raw)
+    check_config(config)
+    return config
+
+
+def describe(storage):
+    if storage['state'] == 'error':
+        return 'storage agent error: ' + storage['error']
+    return str(len(storage['pools'])) + ' pool(s), datasets ' + storage['datasetsStatus']
+
+
+def report_once(config, opener, collect_storage=collect):
+    storage, error = collect_storage(config)
+    if error is not None:
+        # Local detail is fixed text from this agent, never ZFS output or credentials.
+        print('Collection failed: ' + error.code + (' (' + error.detail + ')' if error.detail else ''), flush=True)
+    body, report = encode_report(storage)
+    deliver(config, opener, body)
+    print('Storage status delivered: ' + describe(report['storage']), flush=True)
+
+
+def main(argv=None):
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    path = DEFAULT_CONFIG
+    if '--config' in arguments:
+        index = arguments.index('--config')
+        path = arguments[index + 1]
+        del arguments[index:index + 2]
+    if arguments not in ([], ['--check'], ['--once']):
+        print('Usage: crowsnest_storage.py [--config PATH] [--check | --once]', file=sys.stderr)
+        return 2
+    if arguments == ['--check']:
+        # Local verification without credentials or network: proves read access to ZFS.
+        storage, error = collect({})
+        print(describe(storage))
+        return 1 if error else 0
+    try:
+        config = load_config(path)
+    except (OSError, ValueError) as error:
+        print('Configuration error: ' + type(error).__name__ + ': ' + str(error)[:200], file=sys.stderr)
+        return 1
+    opener = urllib.request.build_opener(NoRedirect())
+    while True:
+        started = time.monotonic()
+        delivered = False
+        try:
+            report_once(config, opener)
+            delivered = True
+        except urllib.error.HTTPError as error:
+            print('Reporting failed: HTTP ' + str(error.code) + '; will retry', flush=True)
+            error.close()
+        except Exception as error:
+            print('Reporting failed: ' + type(error).__name__ + '; will retry', flush=True)
+        if arguments == ['--once']:
+            return 0 if delivered else 1
+        time.sleep(max(1, INTERVAL - (time.monotonic() - started)))
+
+
+if __name__ == '__main__':
+    sys.exit(main())
