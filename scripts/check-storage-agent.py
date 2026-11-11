@@ -7,6 +7,7 @@ import os
 import re
 import stat
 import sys
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -91,7 +92,9 @@ class FixtureChecks(unittest.TestCase):
                     tree(pool)  # Names are unique within each pool.
                     nodes = list(agent.walk(pool['vdevs'][0]))
                     for key in ('read', 'write', 'checksum'):
-                        self.assertEqual(pool['errors'][key], sum(n[key] for n in nodes))
+                        self.assertEqual(pool['errors'][key], nodes[0][key], 'pool totals are the root vdev counters')
+                    for node in nodes[1:]:
+                        self.assertTrue(agent.name_allowed(node['type'], node['name']), node)
                     for node in nodes:
                         self.assertIn(node['class'], agent.VDEV_CLASSES, node)
                         self.assertNotEqual(node['type'], 'unknown', node)
@@ -195,7 +198,7 @@ class FixtureChecks(unittest.TestCase):
         self.assertEqual((log['class'], log['state']), ('other', 'ONLINE'))
         log_errors = json.loads(json.dumps(status))
         log_errors['pools']['zfstest2']['future_section']['/var/tmp/fixture-vdevs-2/log1']['write_errors'] = 7
-        self.assertEqual(agent.pools_summary(log_errors, {'pools': {}}, namer())[0]['errors']['write'], 7, 'section vdevs count toward pool totals')
+        self.assertEqual(tree(agent.pools_summary(log_errors, {'pools': {}}, namer())[0])['log1']['write'], 7, 'section vdev counters are reported')
 
     def test_an_available_spare_is_healthy(self):
         self.assertFalse(agent.attention({'state': 'AVAIL', 'read': 0, 'write': 0, 'checksum': 0}))
@@ -205,7 +208,8 @@ class FixtureChecks(unittest.TestCase):
         pool = self.scenario('08-checksum-errors-after-scrub')
         self.assertEqual((pool['state'], pool['dataErrors']), ('ONLINE', 0))
         self.assertEqual(tree(pool)['disk3']['checksum'], 16)
-        self.assertEqual(pool['errors'], {'read': 0, 'write': 0, 'checksum': 16})
+        # Like zpool status's pool line, the root's own counters stay 0: alerts must use vdev counters.
+        self.assertEqual(pool['errors'], {'read': 0, 'write': 0, 'checksum': 0})
         self.assertEqual((pool['scan']['repairedBytes'], pool['scan']['errors']), (2097152, 0))
 
     def test_synthetic_scenarios(self):
@@ -213,7 +217,7 @@ class FixtureChecks(unittest.TestCase):
         faulted = tree(self.synthetic('faulted-vdev'))['sde']
         self.assertEqual((faulted['state'], faulted['read'], faulted['write']), ('FAULTED', 3, 41))
         corrupt = self.synthetic('checksum-errors')
-        self.assertEqual((corrupt['dataErrors'], corrupt['errors']['checksum'], corrupt['scan']['errors'], corrupt['scan']['repairedBytes']), (2, 17, 2, 1048576))
+        self.assertEqual((corrupt['dataErrors'], tree(corrupt)['sdd']['checksum'], corrupt['scan']['errors'], corrupt['scan']['repairedBytes']), (2, 17, 2, 1048576))
         self.assertEqual(self.synthetic('scrub-in-progress')['scan']['state'], 'scanning')
         resilver = self.synthetic('resilver')
         self.assertEqual((resilver['scan']['type'], tree(resilver)['replacing-1']['type']), ('resilver', 'replacing'))
@@ -301,12 +305,15 @@ class MultipathNamingChecks(unittest.TestCase):
         self.assertEqual(n.identity({'guid': 42}), 'guid:42')
         with self.assertRaises(agent.AgentError):
             n.identity({})
-        # Force every hash prefix to collide: names are lengthened, never shared.
+        # Force the first hash of every disk to collide: the second disk is re-hashed, still 8 hex.
         used = {}
-        with patch.object(agent.DeviceNamer, 'digest', lambda self, identity, length=8: ('0' * 63 + identity[-1])[:length]):
+        real = agent.DeviceNamer.digest
+        forced = lambda self, identity, length=8: '00000000' if '#' not in identity else real(self, identity)
+        with patch.object(agent.DeviceNamer, 'digest', forced):
             names = [n.name({'vdev_type': 'disk', 'name': 'x', 'devid': 'id' + c}, 'tank', used) for c in 'ab']
         self.assertEqual(len(set(names)), 2, names)
         self.assertEqual(names[0], 'disk-00000000')
+        self.assertRegex(names[1], r'^disk-[0-9a-f]{8}$')
         # Many distinct disks under the real HMAC never collide.
         used = {}
         names = [n.name({'vdev_type': 'disk', 'name': 'x', 'devid': 'wwn-0x' + format(i, '016x')}, 'tank', used) for i in range(agent.MAX_VDEVS_PER_POOL)]
@@ -327,11 +334,16 @@ class MultipathNamingChecks(unittest.TestCase):
                             'path': '/dev/disk/by-id/dm-uuid-mpath-36001405ffff0001'}
                     name = namer(root=root).name(node, 'tank', {})
                     self.assertRegex(name, r'^disk-[0-9a-f]{8}$')
-        for base in ('ata-image-copy', 'S6PTNM0R912345X.img', '0x5000cca2b3c4.img'):
+        # File basenames the dashboard would reject (kernel-shaped, hash-shaped, identifiers,
+        # serials and models) are hashed, so a report is never dropped for its names.
+        for base in ('ata-image-copy', 'S6PTNM0R912345X.img', '0x5000cca2b3c4.img', 'sdb', 'loop0', 'md0', 'zd0', 'disk-20240101',
+                     'file-cafebabe', 'KINGSTON_SA400.img', 'WD-WX12-D3456'):
             with self.subTest(file=base):
                 self.assertRegex(namer().name({'vdev_type': 'file', 'name': '/srv/' + base, 'guid': 5}, 'tank', {}), r'^file-[0-9a-f]{8}$')
-        for alias in ('mpatha', 'shelf2-bay07'):
-            self.assertTrue(agent.local_name(alias), alias)
+        self.assertEqual(namer().name({'vdev_type': 'file', 'name': '/srv/vdev.img', 'guid': 5}, 'tank', {}), 'vdev.img')
+        # Only user_friendly_names aliases pass; a custom alias cannot be told from a model or serial.
+        self.assertTrue(agent.name_allowed('disk', 'mpatha'))
+        self.assertFalse(agent.name_allowed('disk', 'shelf2-bay07'))
 
     def test_invalid_salts_are_refused(self):
         for salt in (None, '', 'ab' * 31, 'AB' * 32, 'zz' * 32):
@@ -410,7 +422,7 @@ class ParsingChecks(unittest.TestCase):
         names = [n['name'] for n in agent.walk(pool['vdevs'][0])]
         self.assertTrue(pool['vdevsTruncated'])
         self.assertEqual(names, ['tank', 'raidz3-0', 'sdzz', 'sdzy'])
-        self.assertEqual(pool['errors']['checksum'], 4, 'totals come from the full tree')
+        self.assertEqual(pool['errors']['checksum'], 0, 'totals are the root counters; pruning never hides sdzz')
         deep = {'name': 'sda', 'vdev_type': 'disk', 'state': 'ONLINE'}
         for level in range(agent.MAX_VDEV_DEPTH + 1):
             deep = {'name': 'mirror-' + str(level), 'vdev_type': 'mirror', 'state': 'ONLINE', 'vdevs': {'x': deep}}
@@ -422,6 +434,14 @@ class ParsingChecks(unittest.TestCase):
         datasets = {'datasets': {'tank/d' + str(i): {'properties': {'used': {'value': 1}, 'mountpoint': {'value': '-'}}} for i in range(70)}}
         result, truncated = agent.datasets_summary(datasets, {'tank'})
         self.assertEqual((len(result), truncated), (agent.MAX_DATASETS, True))
+
+    def test_zfs_pool_names_with_spaces_and_255_characters(self):
+        for name in ('my pool', 'p' * 255):
+            status = self.pool()
+            status = json.loads(json.dumps(status).replace('"tank"', json.dumps(name)))
+            self.assertEqual(self.summary(status)[0]['name'], name)
+        with self.assertRaises(agent.AgentError):
+            self.summary(json.loads(json.dumps(self.pool()).replace('"tank"', json.dumps('p' * 256))))
 
     def test_invalid_shapes_are_errors(self):
         for status in ({'pools': []}, {'pools': {'tank': {'name': 'other', 'vdevs': {}}}}, {'pools': {'../x': {'name': '../x'}}},
@@ -517,6 +537,99 @@ class CommandChecks(unittest.TestCase):
         with TemporaryDirectory() as directory, patch.object(agent, 'SAFE_PATH', directory), self.assertRaises(agent.AgentError) as raised:
             agent.run_command('zpool', ('--version',))
         self.assertEqual(raised.exception.code, 'zfs_unavailable')
+
+
+class HangChecks(unittest.TestCase):
+    """A zpool stuck in uninterruptible sleep cannot be killed or reaped: never wait on it."""
+
+    def fake(self, directory, body):
+        path = Path(directory, 'zpool')
+        path.write_text('#!' + sys.executable + '\nimport os, subprocess, sys, time\n' + body + '\n')
+        path.chmod(stat.S_IRWXU)
+
+    def bounded(self, call, seconds=5):
+        """Run call in a watchdog thread; a hang fails the test instead of stalling the suite."""
+        import threading
+        result = {}
+        def target():
+            try:
+                result['value'] = call()
+            except BaseException as error:  # noqa: B036 - the test inspects it
+                result['error'] = error
+        thread = threading.Thread(target=target, daemon=True)
+        started = time.monotonic()
+        thread.start()
+        thread.join(seconds)
+        self.assertFalse(thread.is_alive(), 'agent must give up on a stuck child instead of waiting for it')
+        return result, time.monotonic() - started
+
+    def setUp(self):
+        self.directory = TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.addCleanup(self.reap)
+        for name, value in (('SAFE_PATH', self.directory.name), ('COMMAND_TIMEOUT', 0.5), ('KILL_GRACE', 0.3)):
+            patcher = patch.object(agent, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def reap(self):
+        for child in agent.ABANDONED:
+            try:
+                os.kill(child.pid, 9)
+                child.wait(timeout=5)
+            except (OSError, Exception):
+                pass
+        agent.ABANDONED.clear()
+
+    def test_unkillable_child_is_abandoned_and_the_agent_keeps_reporting(self):
+        launches = Path(self.directory.name, 'launches')
+        self.fake(self.directory.name, 'open(' + repr(str(launches)) + ', "a").write("x")\ntime.sleep(60)')
+        # Simulate uninterruptible sleep: neither the group kill nor the kill has any effect.
+        with patch.object(agent.os, 'killpg', lambda *a: None), patch.object(agent.subprocess.Popen, 'kill', lambda self: None):
+            for expected in (1, 2):
+                result, elapsed = self.bounded(lambda: agent.run_command('zpool', agent.ZPOOL_STATUS))
+                self.assertEqual(result['error'].code, 'timeout')
+                self.assertLess(elapsed, 3)
+                self.assertEqual((agent.stuck_children(), launches.read_text()), (expected, 'x' * expected))
+            # With two queries still stuck, no new process is started: the timeout is reported at once.
+            result, elapsed = self.bounded(lambda: agent.run_command('zpool', ('--version',)))
+            self.assertEqual(result['error'].code, 'timeout')
+            self.assertLess(elapsed, 0.5)
+            self.assertEqual(launches.read_text(), 'xx')
+            # The agent still posts its error state, so the dashboard sees why.
+            sink, output = Sink(), io.StringIO()
+            with contextlib.redirect_stdout(output):
+                result, _ = self.bounded(lambda: agent.report_once(CONFIG, sink))
+            self.assertNotIn('error', result)
+            self.assertEqual(json.loads(sink.requests[0].data)['storage']['error'], 'timeout')
+
+    def test_grandchild_holding_the_pipe_is_killed_with_its_group(self):
+        marker = Path(self.directory.name, 'grandchild')
+        self.fake(self.directory.name, 'g = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])\n'
+                                       'open(' + repr(str(marker)) + ', "w").write(str(g.pid))')
+        result, elapsed = self.bounded(lambda: agent.run_command('zpool', agent.ZPOOL_STATUS))
+        self.assertEqual(result['error'].code, 'timeout')
+        pid = int(marker.read_text())
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            if Path('/proc', str(pid), 'stat').exists() and Path('/proc', str(pid), 'stat').read_text().split()[2] == 'Z':
+                break
+            time.sleep(0.05)
+        else:
+            self.fail('the grandchild holding the pipe must be killed with the process group')
+
+    def test_endless_output_is_cut_off_at_the_cap(self):
+        # About 64 MB/s: the 8 MiB cap is reached in well under a second; without a cap
+        # the read would run to the 3 s timeout (bounded, so a broken cap cannot exhaust memory).
+        self.fake(self.directory.name, 'chunk = b"x" * 65536\nwhile True:\n    sys.stdout.buffer.write(chunk)\n    sys.stdout.buffer.flush()\n    time.sleep(0.001)')
+        with patch.object(agent, 'COMMAND_TIMEOUT', 3):
+            result, elapsed = self.bounded(lambda: agent.run_command('zpool', agent.ZPOOL_STATUS), seconds=6)
+        self.assertEqual(result['error'].code, 'invalid_output', 'the cap applies while reading, not after a timeout')
+        self.assertLess(elapsed, 2)
 
 
 class Response(io.BytesIO):

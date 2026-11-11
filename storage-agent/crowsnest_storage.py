@@ -11,6 +11,8 @@ import json
 import os
 import re
 import secrets
+import selectors
+import signal
 import subprocess
 import sys
 import time
@@ -26,6 +28,13 @@ DEFAULT_CONFIG = '/etc/crowsnest-storage/storage.json'
 INTERVAL = 60
 COMMAND_TIMEOUT = 20
 MAX_COMMAND_OUTPUT = 8 * 1024 * 1024
+MAX_COMMAND_STDERR = 65536
+KILL_GRACE = 2
+# A zpool stuck in uninterruptible kernel sleep (e.g. a SUSPENDED pool) cannot be
+# killed or reaped. Such children are abandoned, never waited on; while this many are
+# still stuck, no new query is started and the agent reports a timeout at once.
+MAX_STUCK_CHILDREN = 2
+ABANDONED = []
 MAX_REPORT_BYTES = 131072
 MAX_POOLS = 16
 MAX_VDEVS_PER_POOL = 128
@@ -69,16 +78,43 @@ IDENTIFIER = re.compile(r'^(?:ata|scsi|sata|sas|wwn|nvme|dm-uuid|dm-name|usb|ide
                         r'|0x[0-9a-f]{4,}|[0-9a-f]{12,}|^dm-[0-9]+$', re.I)
 
 
+KERNEL_BASE = re.compile(r'(?:sd|vd|xvd|hd)[a-z]{1,4}|nvme[0-9]{1,3}n[0-9]{1,3}|mmcblk[0-9]{1,3}|md[0-9]{1,4}|loop[0-9]{1,4}|nbd[0-9]{1,3}|zd[0-9]{1,5}|rbd[0-9]{1,4}')
+HASH_NAME = re.compile(r'(disk|file|device|dspare|mirror|raidz|draid|replacing|spare|indirect|hole|missing)-[0-9a-f]{8}')
+# Only multipath user_friendly_names (mpatha, mpathbz, ...). A custom alias cannot be
+# told apart from a drive model or serial by its shape, so it is hashed instead.
+ALIAS_NAME = re.compile(r'mpath[a-z]{1,4}')
+NAMED_GROUP_TYPES = {'mirror', 'raidz', 'draid', 'replacing', 'spare', 'indirect', 'hole', 'missing'}
+
+
 def serial_like(name):
-    return any(len(re.findall(r'[0-9]', run)) >= 2 and len(re.findall(r'[A-Za-z]', run)) >= 2
-               for run in re.findall(r'[A-Za-z0-9]{8,}', name))
+    """Serial- or model-like: letter/digit runs, also across - _ . : separators."""
+    compact = re.sub(r'[-_.:]', '', name)
+    runs = re.findall(r'[A-Za-z0-9]{8,}', name) + re.findall(r'[A-Za-z0-9]{8,}', compact)
+    return (any(len(re.findall(r'[0-9]', run)) >= 2 and len(re.findall(r'[A-Za-z]', run)) >= 2 for run in runs)
+            or bool(re.search(r'[0-9]{8,}', compact)))
 
 
-def local_name(name):
-    """A multipath alias or file basename that is safe to send as-is."""
-    return (isinstance(name, str) and bool(SAFE_NAME.fullmatch(name))
-            and not IDENTIFIER.search(name) and not serial_like(name))
-POOL_NAME = re.compile(r'[A-Za-z][A-Za-z0-9_.:-]{0,127}')
+def name_allowed(vtype, name):
+    """The dashboard's rule (worker/storage.js storageVdevNameAllowed), mirrored exactly.
+
+    `vtype` is the reported type (unrecognized types are 'unknown'). A name this
+    rejects is never sent; the vdev is named by its salted hash instead.
+    """
+    if not isinstance(name, str):
+        return False
+    hashed = HASH_NAME.fullmatch(name)
+    if hashed:
+        return hashed.group(1) == ('device' if vtype == 'unknown' else vtype)
+    if vtype in NAMED_GROUP_TYPES:
+        return bool(GROUP_NAME.fullmatch(name))
+    if vtype in ('disk', 'dspare', 'unknown'):
+        return bool(KERNEL_BASE.fullmatch(name) or ALIAS_NAME.fullmatch(name))
+    if vtype == 'file':
+        return (bool(SAFE_NAME.fullmatch(name)) and not KERNEL_BASE.fullmatch(name)
+                and not IDENTIFIER.search(name) and not serial_like(name))
+    return False
+# ZFS pool names: a letter, then letters, digits, _ - . : and spaces; at most 255 bytes.
+POOL_NAME = re.compile(r'[A-Za-z][A-Za-z0-9_.: -]{0,254}')
 
 
 class AgentError(Exception):
@@ -173,8 +209,7 @@ class DeviceNamer:
             return None
         alias, wwid = self._sys(device, 'dm', 'name'), uuid[len('mpath-'):]
         # Without user_friendly_names or an alias the map is named by its WWID: not an alias.
-        # An alias that looks like a serial, WWN or by-id name is not used either.
-        if not alias or not wwid or wwid in alias or not local_name(alias):
+        if not alias or not wwid or wwid in alias or not ALIAS_NAME.fullmatch(alias):
             return None
         return alias
 
@@ -196,26 +231,26 @@ class DeviceNamer:
         raise AgentError('invalid_output', 'vdev has no stable identity')
 
     def preferred(self, node, pool_name):
-        """A pass-through name, or None when the vdev must be named by hash."""
+        """A pass-through name the dashboard accepts, or None to name the vdev by hash."""
         vtype, name = node.get('vdev_type'), node.get('name')
         if vtype == 'root':
             return pool_name
+        reported = vtype if vtype in GROUP_TYPES | LEAF_TYPES else 'unknown'
         if vtype in GROUP_TYPES or vtype in ('indirect', 'hole', 'missing'):
-            return name if isinstance(name, str) and GROUP_NAME.fullmatch(name) else None
-        if vtype == 'file':
-            base = os.path.basename(name) if isinstance(name, str) else ''
-            return base if local_name(base) else None
-        # By-id names are not resolved to sdX: kernel ordering is not stable either.
-        short = kernel_name(name)
-        if short:
-            return short
-        device = self.dm_device(node)
-        return self.multipath_alias(device) if device else None
+            candidate = name
+        elif vtype == 'file':
+            candidate = os.path.basename(name) if isinstance(name, str) else None
+        else:
+            # By-id names are not resolved to sdX: kernel ordering is not stable either.
+            device = self.dm_device(node)
+            candidate = kernel_name(name) or (self.multipath_alias(device) if device else None)
+        return candidate if name_allowed(reported, candidate) else None
 
-    def hashed(self, node, identity, length=HASH_LENGTH):
+    def hashed(self, node, identity, attempt=0):
         vtype = node.get('vdev_type')
         label = vtype if vtype in GROUP_TYPES | LEAF_TYPES else 'device'
-        return label + '-' + self.digest(identity, length)
+        # Always exactly 8 hex digits, so a 16-hex WWN or EUI can never pass as a hash.
+        return label + '-' + self.digest(identity if attempt == 0 else identity + '#' + str(attempt))
 
     def name(self, node, pool_name, used):
         """Unique within the pool: `used` maps each assigned name to its identity."""
@@ -225,14 +260,13 @@ class DeviceNamer:
             used[preferred] = object()
             return preferred
         identity = self.identity(node)
-        length = HASH_LENGTH
-        candidate = self.hashed(node, identity, length)
-        # Distinct disks never share a name: lengthen the hash on any collision.
+        attempt, candidate = 0, self.hashed(node, identity)
+        # Distinct disks never share a name: re-hash with a counter on any collision.
         while candidate in used and used[candidate] != identity:
-            if length >= 64:
+            attempt += 1
+            if attempt > 64:
                 raise AgentError('invalid_output', 'duplicate vdev identity')
-            length = min(64, length * 2)
-            candidate = self.hashed(node, identity, length)
+            candidate = self.hashed(node, identity, attempt)
         if candidate in used:
             raise AgentError('invalid_output', 'duplicate vdev identity')
         used[candidate] = identity
@@ -387,9 +421,11 @@ def pools_summary(status, listing, namer):
             'free': list_property(properties, 'free'),
             'capacityPercent': capacity if capacity is None or capacity <= 100 else None,
             'fragmentationPercent': fragmentation if fragmentation is None or fragmentation <= 100 else None,
-            # Totals are sums over every vdev in the full tree; error_count (permanent
-            # data errors) is separate and can be 0 while a vdev reports checksum errors.
-            'errors': {key: sum(n[key] for n in nodes) for key in ('read', 'write', 'checksum')},
+            # Pool totals are the root vdev's own counters, as on zpool status's pool
+            # line (a failure is counted at each level that fails, so a tree sum would
+            # overstate). Alerts use per-vdev counters. error_count (permanent data
+            # errors) is separate and can be 0 while a vdev reports checksum errors.
+            'errors': {key: tree[key] for key in ('read', 'write', 'checksum')},
             'dataErrors': counter(pool, 'error_count'),
             'scan': scan_summary(pool.get('scan_stats')),
             'vdevs': [tree],
@@ -437,26 +473,88 @@ def find_command(name):
     raise AgentError('zfs_unavailable', name + ' not found')
 
 
-def run_command(program, arguments):
-    """Run a fixed read-only query with a clean environment, a timeout and an output cap."""
+def stuck_children():
+    """Count abandoned children still running; reap any that have exited (non-blocking)."""
+    ABANDONED[:] = [child for child in ABANDONED if child.poll() is None]
+    return len(ABANDONED)
+
+
+def abandon(child):
+    """Kill a query without ever blocking on it: close our pipes, kill its process
+    group, allow a short grace period, then give up on it if it still has not exited."""
+    for stream in (child.stdout, child.stderr):
+        try:
+            stream.close()
+        except OSError:
+            pass
     try:
-        completed = subprocess.run([find_command(program), *arguments], stdin=subprocess.DEVNULL,
-                                   capture_output=True, timeout=COMMAND_TIMEOUT, check=False,
-                                   env={'PATH': SAFE_PATH, 'LC_ALL': 'C'})
-    except subprocess.TimeoutExpired as error:
-        raise AgentError('timeout', program + ' timed out') from error
+        os.killpg(child.pid, signal.SIGKILL)  # Its own session: grandchildren too.
+    except OSError:
+        pass
+    try:
+        child.kill()
+    except OSError:
+        pass
+    try:
+        child.wait(timeout=KILL_GRACE)
+    except subprocess.TimeoutExpired:
+        ABANDONED.append(child)
+
+
+def run_command(program, arguments):
+    """Run a fixed read-only query with a clean environment, a deadline and output caps.
+
+    Output is read as it arrives, so the cap is enforced without buffering more than
+    it; on a timeout the child is abandoned rather than waited on (see abandon()).
+    """
+    if stuck_children() >= MAX_STUCK_CHILDREN:
+        raise AgentError('timeout', 'earlier queries are still stuck; not starting ' + program)
+    command = find_command(program)
+    try:
+        child = subprocess.Popen([command, *arguments], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, env={'PATH': SAFE_PATH, 'LC_ALL': 'C'},
+                                 close_fds=True, start_new_session=True)
     except OSError as error:
         raise AgentError('zfs_unavailable', type(error).__name__) from error
-    if len(completed.stdout) > MAX_COMMAND_OUTPUT:
-        raise AgentError('invalid_output', program + ' output exceeds limit')
-    if completed.returncode != 0:
-        message = completed.stderr.decode('utf-8', 'replace')
+    deadline = time.monotonic() + COMMAND_TIMEOUT
+    output, errors, failure = bytearray(), bytearray(), None
+    buffers = {child.stdout.fileno(): (output, MAX_COMMAND_OUTPUT), child.stderr.fileno(): (errors, MAX_COMMAND_STDERR)}
+    with selectors.DefaultSelector() as selector:
+        selector.register(child.stdout, selectors.EVENT_READ)
+        selector.register(child.stderr, selectors.EVENT_READ)
+        while selector.get_map() and failure is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                failure = AgentError('timeout', program + ' timed out')
+                break
+            for key, _ in selector.select(remaining):
+                chunk = os.read(key.fd, 65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                buffer, limit = buffers[key.fd]
+                buffer.extend(chunk)
+                if len(buffer) > limit:
+                    failure = AgentError('invalid_output', program + ' output exceeds limit')
+                    break
+    if failure is None:
+        try:
+            child.wait(timeout=max(0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            failure = AgentError('timeout', program + ' timed out')
+    if failure is not None:
+        abandon(child)
+        raise failure
+    child.stdout.close()
+    child.stderr.close()
+    if child.returncode != 0:
+        message = bytes(errors).decode('utf-8', 'replace')
         if re.search(r'invalid option|unrecognized option|unknown option', message, re.I):
             raise AgentError('unsupported_version', program + ' does not support JSON output')
         if re.search(r'permission denied|not permitted', message, re.I):
             raise AgentError('permission_denied', program + ' permission denied')
-        raise AgentError('command_failed', program + ' exited with ' + str(completed.returncode))
-    return completed.stdout
+        raise AgentError('command_failed', program + ' exited with ' + str(child.returncode))
+    return bytes(output)
 
 
 def run_json(program, arguments):

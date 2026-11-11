@@ -687,11 +687,19 @@ $('remove-form').onsubmit=async event=>{
   catch(error){if(managementCurrent(session,id)){showError('management-message',error);$('remove-host').disabled=false;}}
 };
 $('rotate-token').onclick=async()=>{
-  const id=managedId, session=managementSession, revision=hosts.find(h=>h.id===managedId)?.credentialRevision||0;
+  const id=managedId, session=managementSession, managedHost=hosts.find(h=>h.id===managedId), revision=managedHost?.credentialRevision||0;
   $('rotate-token').disabled=true;$('management-message').hidden=true;
   try {
-    const response=await mutate('/api/hosts/'+id+'/collector','POST',{format:'config'});
+    const format=credentialFormat(managedHost);
+    const response=await mutate('/api/hosts/'+id+'/collector','POST',{format});
     if(!managementCurrent(session,id)){await response.body?.cancel();return;}
+    if(format==='storage-token') {
+      const command=storageTokenCommand(await response.json());if(!managementCurrent(session,id))return;
+      $('config-download').hidden=true;rotationRevision=revision;rotationExpiry=Date.now()+600000;
+      $('rotation-commands').textContent=command;$('rotation-result').hidden=false;updateEnrollment();
+      return;
+    }
+    $('config-download').hidden=false;
     const blob=await response.blob();if(!managementCurrent(session,id))return;
     if(configUrl)URL.revokeObjectURL(configUrl);configUrl=URL.createObjectURL(blob);
     $('config-download').href=configUrl;rotationRevision=revision;rotationExpiry=Date.now()+600000;
@@ -699,6 +707,13 @@ $('rotate-token').onclick=async()=>{
     $('rotation-result').hidden=false;updateEnrollment();$('config-download').focus();
   }catch(error){if(managementCurrent(session,id))showError('management-message',error);}finally{if(managementCurrent(session,id))$('rotate-token').disabled=false;}
 };
+// Storage hosts replace only the token in place (their vdev-name salt is kept);
+// Docker hosts receive a new collector.json.
+function credentialFormat(host) {return host?.kind==='storage'?'storage-token':'config';}
+function storageTokenCommand(data) {
+  if(!data || typeof data.tokenCommand!=='string' || !data.tokenCommand.startsWith("sudo bash <<'CROWSNEST_STORAGE_TOKEN'\n"))throw new Error('The credential response is incomplete. Close this dialog and try again.');
+  return data.tokenCommand;
+}
 const context = document.modelContext;
 if (context?.registerTool) {
   const lifecycle = new AbortController();

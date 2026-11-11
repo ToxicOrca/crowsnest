@@ -3,13 +3,21 @@ import {chmodSync,existsSync,mkdtempSync,mkdirSync,readFileSync,rmSync,statSync,
 import {spawnSync} from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
+import {testBucket} from './test-storage.mjs';
 
-// Render the installer the way the dashboard embeds collector files: quoted heredocs.
-const config={url:'https://board.example.com',hostId:'00000000-0000-4000-8000-000000000000',hostToken:'test-host-token'};
+// Use what the dashboard actually ships: the setup command from the built Worker.
+const worker=(await import('data:text/javascript;base64,'+readFileSync('dist/server/index.js').toString('base64'))).default;
+const dashboard={SITE_ORIGIN:'https://board.example.com',AUTH_MODE:'standalone',BUCKET:testBucket(new Map())};
+const enrolled=await (await worker.fetch(new Request(dashboard.SITE_ORIGIN+'/api/hosts',{method:'POST',headers:{'oai-authenticated-user-id':'owner',Origin:dashboard.SITE_ORIGIN},body:JSON.stringify({name:'zfs-host',kind:'storage'})}),dashboard)).json();
+const shipped=enrolled.setupCommand, shippedLines=shipped.split('\n');
+assert.deepEqual([shippedLines[0],shippedLines[1],shippedLines.at(-2),shippedLines.at(-1)],["sudo bash <<'CROWSNEST_STORAGE_SETUP'",'export CROWSNEST_PREPARE_ONLY=1','CROWSNEST_STORAGE_SETUP','']);
+const config=JSON.parse(shipped.match(/cat > storage\.json <<'CROWSNEST_FILE_EOF'\n([\s\S]*?)\nCROWSNEST_FILE_EOF/)[1]);
+// The shipped installer without its prepare-only export, for the full-install cases.
+const installer=shippedLines.slice(2,-2).join('\n');
 const agent=readFileSync('storage-agent/crowsnest_storage.py','utf8'), unit=readFileSync('storage-agent/crowsnest-storage.service','utf8');
 const files=[['crowsnest_storage.py',agent],['crowsnest-storage.service',unit],['storage.json',JSON.stringify(config,null,2)]];
 const render=entries=>readFileSync('storage-agent/setup.sh','utf8').replace('__WRITE_FILES__',()=>entries.map(([file,body])=>"cat > "+file+" <<'CROWSNEST_FILE_EOF'\n"+body+"\nCROWSNEST_FILE_EOF\n").join(''));
-const installer=render(files);
+assert.equal(render(files),installer,'the variants below are rendered exactly like the shipped installer');
 const root=mkdtempSync(path.join(os.tmpdir(),'crowsnest-storage-install-test-'));
 const bin=path.join(root,'bin'), calls=path.join(root,'calls'), script=path.join(root,'crowsnest-storage-setup.sh');
 mkdirSync(bin);
@@ -19,8 +27,13 @@ shim('id',`if [[ "$*" == '-u' ]]; then if [[ "\${TEST_AS_ROOT:-}" == 1 ]]; then 
 if [[ "$*" == '-u crowsnest-storage' && "\${TEST_USER_EXISTS:-}" == 1 ]]; then echo 999; exit 0; fi
 exit 1`);
 for(const name of ['useradd','chown'])shim(name,'');
-shim('runuser',`if [[ "\${TEST_CHECK_FAILURE:-}" == 1 ]]; then echo 'storage agent error: permission_denied'; exit 1; fi
+// runuser cannot switch users without root; the stub checks the exact argv and that the
+// installed agent is valid Python before reporting the --check result.
+shim('runuser',`[[ "$1 $2 $3 $4 $5 \${7:-}" == '-u crowsnest-storage -- /usr/bin/python3 -I --check' && $# == 7 ]] || { echo "unexpected runuser $*" >&2; exit 2; }
+/usr/bin/python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$6" || { echo 'installed agent is not valid Python' >&2; exit 3; }
+if [[ "\${TEST_CHECK_FAILURE:-}" == 1 ]]; then echo 'storage agent error: permission_denied'; exit 1; fi
 echo '3 pool(s), datasets complete'`);
+shim('sudo','exec "$@"');
 shim('systemctl',`if [[ "$*" == 'enable --now crowsnest-storage' && "\${TEST_START_FAILURE:-}" == 1 ]]; then exit 1; fi`);
 shim('zpool','');
 const run=(target,extra={},args=[])=>{
@@ -33,6 +46,16 @@ const layout=target=>({app:path.join(target,'opt/crowsnest-storage'),etc:path.jo
 try {
   assert.equal(spawnSync('bash',['-n',script]).status,0,'installer is valid Bash');
   assert.ok(!installer.includes('__WRITE_FILES__'));
+
+  // The exact command the dashboard shows, pasted into a terminal: prepares and starts nothing.
+  const pasted=path.join(root,'pasted');
+  writeFileSync(calls,'');
+  const pastedResult=spawnSync('bash',['-c',shipped],{cwd:root,encoding:'utf8',env:{...process.env,PATH:bin+':'+process.env.PATH,TEST_CALLS:calls,CROWSNEST_STORAGE_ROOT:pasted,TEST_AS_ROOT:'1'}});
+  assert.equal(pastedResult.status,0,pastedResult.stderr);
+  const pastedCalls=readFileSync(calls,'utf8');
+  assert.ok(existsSync(path.join(pasted,'etc/crowsnest-storage/storage.json')) && !pastedCalls.includes('systemctl'),'the shipped command is prepare-only');
+  assert.equal(readFileSync(path.join(pasted,'opt/crowsnest-storage/crowsnest_storage.py'),'utf8'),agent+'\n');
+  assert.match(pastedCalls,/^runuser -u crowsnest-storage -- \/usr\/bin\/python3 -I .*crowsnest_storage\.py --check$/m);
 
   // Prepare-only: inspectable files, private credentials, verified access, nothing started.
   const target=path.join(root,'prepared'), paths=layout(target);

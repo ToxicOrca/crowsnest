@@ -56,6 +56,13 @@ try {
   const sitesResponse=await call('/api/ingest/'+sitesHost,'POST',fixture('captured-scenarios/04-scrub-finished'),{Authorization:'Bearer test-host-token'},sitesIngest);
   assert.equal(sitesResponse.status,409,'a storage record on Sites is refused at ingest');
   assert.deepEqual([...sitesObjects.keys()],['hosts/'+sitesHost+'.json'],'nothing is written to R2');
+  // The other gates, for a storage record that exists on R2: each must refuse for the gate's own reason.
+  const sitesRecord=sitesObjects.get('hosts/'+sitesHost+'.json');
+  const sitesStorage=await call('/api/storage?host='+sitesHost,'GET',undefined,viewer,sitesIngest);
+  assert.deepEqual([sitesStorage.status,(await sitesStorage.json()).error],[404,'Storage hosts require a standalone dashboard'],'/api/storage is refused by the Sites gate, not as an unknown host');
+  const sitesToken=await call('/api/hosts/'+sitesHost+'/collector','POST',{format:'storage-token'},viewer,sitesIngest);
+  assert.deepEqual([sitesToken.status,(await sitesToken.json()).error],[409,'Storage hosts require a standalone dashboard'],'storage token replacement is refused on Sites');
+  assert.equal(sitesObjects.get('hosts/'+sitesHost+'.json'),sitesRecord,'no pending token is written to R2');
   assert.equal((await call('/api/storage?host=00000000-0000-4000-8000-000000000000','GET',undefined,viewer,sites)).status,404);
   assert.equal((await (await call('/api/hosts','GET',undefined,viewer,sites)).json()).storageHosts,false);
 
@@ -122,7 +129,11 @@ try {
     ['root name',r=>{root(r).name='other';},'pool root vdev'],['root type',r=>{root(r).type='mirror';},'pool root vdev'],['two roots',r=>{pool(r).vdevs.push(clone(root(r)));},'pool vdevs'],
     ['nested root',r=>{root(r).children[0].type='root';},'pool root vdev'],
     ['vdev class',r=>{leaf(r).class='tape-library';},'vdev class'],['root class',r=>{root(r).class='special';},'vdev class'],
-    ['totals mismatch',r=>{pool(r).errors.checksum=3;},'pool error totals'],['truncated shows more',r=>{pool(r).vdevsTruncated=true;pool(r).errors.checksum=1;},'pool error totals'],
+    // Pool totals equal the root vdev's own counters exactly, in both directions.
+    ['totals above the root',r=>{pool(r).errors.checksum=root(r).checksum+1;},'pool error totals'],
+    ['totals summed over the tree',r=>{pool(r).errors.checksum=16;},'pool error totals'],
+    ['totals below the root',r=>{root(r).checksum=5;pool(r).errors.checksum=4;},'pool error totals'],
+    ['truncated totals still match the root',r=>{pool(r).vdevsTruncated=true;pool(r).errors.checksum=1;},'pool error totals'],
     ['capacity',r=>{pool(r).capacityPercent=101;},'pool capacity'],['size',r=>{pool(r).size=-5;},'pool size'],
     ['allocated above size',r=>{pool(r).allocated=pool(r).size+1;},'pool sizes'],['allocated plus free above size',r=>{pool(r).free=pool(r).free+4096;},'pool sizes'],
     ['capacity does not match sizes',r=>{pool(r).capacityPercent=5;},'pool capacity does not match its sizes'],['scan type',r=>{pool(r).scan.type='defrag';},'scan type or state'],
@@ -138,6 +149,10 @@ try {
     ['dataset of an unreported pool',r=>{r.storage.datasets[1].name='elsewhere/library';},'dataset pool or depth',withDatasets],
     ['dataset deeper than one level',r=>{r.storage.datasets[1].name='bulk/library/nested';},'dataset pool or depth',withDatasets],
     ['mountpoint over 256 UTF-16 units',r=>{r.storage.datasets[1].mountpoint='/'+'\u{1D11E}'.repeat(128);},'dataset mountpoint',withDatasets],
+    ['bidi control in a dataset name',r=>{r.storage.datasets[1].name='bulk/lib\u202Eyrar';},'dataset name',withDatasets],
+    ['C1 control in a mountpoint',r=>{r.storage.datasets[1].mountpoint='/bulk/\x85library';},'dataset mountpoint',withDatasets],
+    ['zero-width space in a dataset name',r=>{r.storage.datasets[1].name='bulk/lib\u200Brary';},'dataset name',withDatasets],
+    ['pool name over 255 characters',r=>{const name='p'.repeat(256);pool(r).name=name;root(r).name=name;},'pool name'],
   ];
   const resilver=scenario('06-resilver-in-progress');
   invalid.push(['resilver labelled repaired',r=>{pool(r).scan.repairedBytes=pool(r).scan.resilveredBytes;delete pool(r).scan.resilveredBytes;},'scan byte label',resilver],
@@ -149,11 +164,20 @@ try {
     assert.equal((await ingest(report)).status,400,name);
     assert.equal(objects.get('snapshots/'+id+'.json'),before,name+' must not change the snapshot');
   }
+  // ZFS allows spaces in pool names and up to 255 characters: such a pool must not drop the report.
+  for(const name of ['my pool','p'.repeat(255),'tank.2:x-y_z']) {
+    const report=clone(base);pool(report).name=name;root(report).name=name;
+    assert.equal(reason(report),null,'pool name '+name.slice(0,20));
+  }
+  const spaced=clone(withDatasets), spacedPool=spaced.storage.pools[0], oldName=spacedPool.name;
+  spacedPool.name=spacedPool.vdevs[0].name='bulk store';
+  spaced.storage.datasets=spaced.storage.datasets.map(d=>d.name.split('/')[0]===oldName?{...d,name:d.name.replace(oldName,'bulk store')}:d);
+  assert.equal(reason(spaced),null,'datasets of a pool whose name has a space');
   assert.equal(reason({...clone(withDatasets),storage:{...clone(withDatasets).storage,datasets:clone(withDatasets).storage.datasets.map(d=>({...d,mountpoint:d.mountpoint&&d.mountpoint.slice(0,1)+'\u{1D11E}'.repeat(127)}))}}),null,'254 UTF-16 units is within the limit');
 
   // Names: the server independently allows only shapes the agent emits, per vdev type.
   const accepted=[['disk','sda'],['disk','sdab'],['disk','nvme0n1'],['disk','vdb'],['disk','xvdf'],['disk','mmcblk0'],['disk','md127'],['disk','zd16'],
-    ['disk','mpatha'],['disk','mpathbz'],['disk','shelf2-bay07'],['disk','disk-3f9a2c11'],['disk','disk-'+'ab'.repeat(32)],['dspare','dspare-0a1b2c3d'],['unknown','device-0a1b2c3d'],['unknown','sdc'],
+    ['disk','mpatha'],['disk','mpathbz'],['disk','disk-3f9a2c11'],['dspare','dspare-0a1b2c3d'],['unknown','device-0a1b2c3d'],['unknown','sdc'],
     ['file','vdev.img'],['file','disk1'],['file','file-0a1b2c3d'],['mirror','mirror-0'],['raidz','raidz2-1'],['draid','draid1:4d:6c:1s-0'],['replacing','replacing-1'],['spare','spare-3'],['mirror','mirror-0a1b2c3d']];
   const rejected=[
     // Real-world by-id and identifier formats (fictional serials).
@@ -161,12 +185,25 @@ try {
     ['disk','wwn-0x5000cca2b3c4d5e6'],['disk','nvme-eui.002538b8a1b2c3d4'],['disk','nvme-INTEL_SSDPE2KX040T8_PHLJ0FAKE01'],['disk','nvme-Micron_7450_MTFDKCC3T8TFR_22F0FAKE'],
     ['disk','dm-uuid-mpath-36001405abcdef012'],['disk','dm-name-mpatha'],['disk','usb-SanDisk_Ultra_4C530001-0:0'],['disk','virtio-QM00001'],['disk','0x5000cca2b3c4d5e6'],
     ['disk','6001405abcdef0123456'],['disk','WD-WCC7K0FAKE12'],['disk','ZA1B2C3D'],['disk','dm-3'],['file','ata-image-copy'],['file','S6PTNM0R912345X.img'],
+    // Identifiers dressed as hashes, split serials, models and custom aliases.
+    ['disk','disk-5000cca2b3c4d5e6'],['disk','disk-002538b8a1b2c3d4'],['disk','disk-'+'ab'.repeat(32)],['disk','S3Z9-NB0K-123456X'],['disk','WD-WX12-D3456'],
+    ['disk','18071234567'],['disk','Acme_SSD_990'],['disk','KINGSTON_SA400'],['disk','shelf2-bay07'],['file','KINGSTON_SA400.img'],['file','backup-20240101.img'],
+    // File basenames shaped like kernel names or another type's hash (would drop a report if sent).
+    ['file','sdb'],['file','loop0'],['file','md0'],['file','zd0'],['file','disk-20240101'],
     // A name of the wrong shape for its type.
     // Group types only take ZFS group names or their own hash label; local names
     // (aliases, basenames) are free-form but bounded and identifier-free.
     ['mirror','sda'],['mirror','mirror'],['raidz','file-0a1b2c3d'],['disk','/dev/sda'],['disk','x'.repeat(65)]];
   for(const [type,name] of accepted)assert.ok(sandbox.nameAllowed(type,name),'accept '+type+' '+name);
   for(const [type,name] of rejected)assert.ok(!sandbox.nameAllowed(type,name),'reject '+type+' '+name);
+  // Parity: the agent's name_allowed() and the server's rule give identical verdicts.
+  const table=[...accepted,...rejected,...['disk','file','mirror','raidz','unknown','dspare','spare'].flatMap(type=>['mirror-0','raidz1-0','spare-1','sda','nvme0n1','mpatha','vdev.img','disk1','x','file-0a1b2c3d','disk-0a1b2c3d','mirror-0a1b2c3d','device-0a1b2c3d','spare-0a1b2c3d','a b','',null].map(name=>[type,name]))];
+  const agentVerdicts=JSON.parse(spawnSync('python3',['-I','-c',`
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location('agent', 'storage-agent/crowsnest_storage.py')
+agent = importlib.util.module_from_spec(spec); spec.loader.exec_module(agent)
+print(json.dumps([agent.name_allowed(t, n) for t, n in json.loads(sys.argv[1])]))`,JSON.stringify(table)],{encoding:'utf8'}).stdout);
+  table.forEach(([type,name],i)=>assert.equal(agentVerdicts[i],sandbox.nameAllowed(type,name),'agent and server agree on '+type+' '+JSON.stringify(name)));
   // ...and every name the agent produces for those inputs is one the server accepts.
   const agentNames=JSON.parse(spawnSync('python3',['-I','-c',`
 import importlib.util, json, sys
@@ -209,10 +246,10 @@ print(json.dumps(out))`,JSON.stringify([...accepted,...rejected])],{encoding:'ut
   const corrupted=scenario('08-checksum-errors-after-scrub');
   assert.deepEqual(await step(corrupted),['zfstest/disk3: errors increased (checksum 0 → 16)','zfstest: scrub finished (repaired 2.0 MiB, 0 error(s))']);
   // zpool clear or a reboot resets counters: a decrease is a reset, never a recovery or an error.
-  const cleared=clone(corrupted);leafNamed(cleared,'disk3').checksum=0;pool(cleared).errors.checksum=0;
+  const cleared=clone(corrupted);leafNamed(cleared,'disk3').checksum=0;
   assert.deepEqual(await step(cleared),['zfstest/disk3: error counters reset (zpool clear or reboot); now read 0, write 0, checksum 0']);
   assert.deepEqual(await step(corrupted),['zfstest/disk3: errors increased (checksum 0 → 16)'],'new errors after a reset count from the new baseline');
-  const partial=clone(corrupted);leafNamed(partial,'disk3').checksum=2;pool(partial).errors.checksum=2;
+  const partial=clone(corrupted);leafNamed(partial,'disk3').checksum=2;
   assert.deepEqual(await step(partial),['zfstest/disk3: error counters reset (zpool clear or reboot); now read 0, write 0, checksum 2'],'a decrease is a reset even if errors remain');
   // Agent error state and recovery: changes are measured against the last successful report.
   const failed={agentVersion:base.agentVersion,agentProtocol:1,storage:{state:'error',error:'permission_denied',zfsVersion:'2.4.1-1',pools:[],datasetsStatus:'disabled'}};
@@ -297,6 +334,9 @@ print(json.dumps(out))`,JSON.stringify([...accepted,...rejected])],{encoding:'ut
     get:async key=>{if(hooks.get)await hooks.get(key);return realBucket.get(key);},
     put:async(key,value,options)=>{if(hooks.put)await hooks.put(key,value,options);return realBucket.put(key,value,options);}};};
   const historyKey='storage-history/'+id+'.json', stateKey='storage/'+id+'.json';
+  // Worst case for the retry tests: both reports in the same millisecond (a fast machine).
+  const RealDate=Date, frozen=RealDate.now();
+  globalThis.Date=class extends RealDate{constructor(...args){super(...(args.length?args:[frozen]));}static now(){return frozen;}};
   try {
     objects.delete(historyKey);
     let injected=false;
@@ -305,10 +345,13 @@ print(json.dumps(out))`,JSON.stringify([...accepted,...rejected])],{encoding:'ut
     assert.equal((await ingest(corrupted)).status,200);
     assert.deepEqual(history().map(s=>s.pools[0][0]),['concurrent','zfstest'],'history retries and keeps the concurrent reading');
     injected=false;
+    // An identical state is (correctly) not rewritten, so make sure this report has something to write.
+    set(stateKey,{...read(stateKey),at:new RealDate(frozen-60000).toISOString()});
     const later={endTime:'2030-01-01T00:00:00Z',errors:0,repairedBytes:0};
     intercept({put:async key=>{if(key===stateKey && !injected){injected=true;set(stateKey,{...read(stateKey),at:new Date(Date.now()-1000).toISOString(),pools:{zfstest:{lastScrub:later}}});}}});
     assert.equal((await ingest(corrupted)).status,200);
     assert.deepEqual(read(stateKey).pools.zfstest.lastScrub,later,'state retries and keeps the concurrent writer\'s newer scrub');
+    globalThis.Date=RealDate;
     // A state written by a newer report is never replaced by an older one.
     intercept({});
     const newer={...read(stateKey),at:new Date(Date.now()+3600000).toISOString(),marker:'newer'};set(stateKey,newer);
@@ -323,7 +366,7 @@ print(json.dumps(out))`,JSON.stringify([...accepted,...rejected])],{encoding:'ut
     assert.equal((await ingest(corrupted)).status,200);
     assert.ok(window && Math.floor(Date.parse(receivedAt)/300000)===Math.floor((Date.parse(receivedAt)+1)/300000));
     assert.deepEqual(history().map(s=>s.pools[0][0]),['newer-in-window'],'the newer reading in the window is kept');
-  } finally {env.BUCKET=realBucket;}
+  } finally {env.BUCKET=realBucket;globalThis.Date=RealDate;}
 
   // Last completed scrub is remembered across a resilver; never seen is "unknown", not "never".
   const scrubs=async()=>(await (await call('/api/storage?host='+id)).json()).scrubs;
@@ -344,6 +387,16 @@ print(json.dumps(out))`,JSON.stringify([...accepted,...rejected])],{encoding:'ut
   assert.equal((await call('/api/storage?host=00000000-0000-4000-8000-000000000000')).status,404);
   assert.equal((await call('/api/storage?host='+id,'GET',undefined,{})).status,401,'private like every viewer route');
 
+  // The dashboard's Replace-token button asks for the right format per host kind,
+  // and the server's answer passes the board's own validation.
+  const boardContext=vm.createContext({});
+  vm.runInContext(board.slice(board.indexOf('function credentialFormat('),board.indexOf('const context = document.modelContext;'))+';this.credentialFormat=credentialFormat;this.storageTokenCommand=storageTokenCommand;',boardContext);
+  const listed=Object.fromEntries((await (await call('/api/hosts')).json()).hosts.map(h=>[h.id,h]));
+  assert.equal(boardContext.credentialFormat(listed[docker.hostId]),'config','Docker hosts keep their collector.json flow');
+  const viaBoard=await call('/api/hosts/'+id+'/collector','POST',{format:boardContext.credentialFormat(listed[id])});
+  assert.equal(viaBoard.status,200,'the board requests storage-token for a storage host');
+  assert.match(boardContext.storageTokenCommand(await viaBoard.json()),/^sudo bash <<'CROWSNEST_STORAGE_TOKEN'\n/);
+  assert.throws(()=>boardContext.storageTokenCommand({tokenCommand:'rm -rf /'}),/incomplete/);
   // Credential replacement keeps the host-local salt and therefore every vdev name.
   for(const format of ['compose','config','setup','update'])assert.equal((await call('/api/hosts/'+id+'/collector','POST',{format})).status,400,format);
   assert.equal((await call('/api/hosts/'+docker.hostId+'/collector','POST',{format:'storage-token'})).status,400);

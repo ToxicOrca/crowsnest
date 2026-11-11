@@ -21,24 +21,36 @@ const STORAGE_SCAN_TYPES = new Set(['scrub','resilver','errorscrub','other']);
 const STORAGE_SCAN_STATES = new Set(['scanning','finished','canceled','unknown']);
 const STORAGE_ERRORS = new Set(['zfs_unavailable','unsupported_version','permission_denied','command_failed','timeout','invalid_output','limit_exceeded','report_limit']);
 const STORAGE_DATASET_STATUS = new Set(['complete','truncated','unavailable','disabled','report_limit']);
-const STORAGE_POOL_NAME = /^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/;
+// ZFS pool names: a letter, then letters, digits, _ - . : and spaces; at most 255 bytes.
+const STORAGE_POOL_NAME = /^[A-Za-z][A-Za-z0-9_.: -]{0,254}$/;
 // Vdev names: the server independently allows only the shapes the agent can emit,
 // per vdev type, so privacy never rests on the agent alone.
 const STORAGE_KERNEL_NAME = /^(?:(?:sd|vd|xvd|hd)[a-z]{1,4}|nvme[0-9]{1,3}n[0-9]{1,3}|mmcblk[0-9]{1,3}|md[0-9]{1,4}|loop[0-9]{1,4}|nbd[0-9]{1,3}|zd[0-9]{1,5}|rbd[0-9]{1,4})$/;
 const STORAGE_GROUP_NAME = /^(?:mirror|raidz[1-3]?|draid[1-3](?::[0-9]{1,3}[dcs]){0,3}|replacing|spare|indirect|hole|missing)-[0-9]{1,4}$/;
-const STORAGE_HASH_NAME = /^(?:disk|file|device|dspare|mirror|raidz|draid|replacing|spare|indirect|hole|missing)-[0-9a-f]{8,64}$/;
-// Multipath aliases and file basenames: a short local name...
+// Exactly 8 hex digits (the agent re-hashes on collision), so a 16-hex WWN or EUI
+// can never pass as a hash name.
+const STORAGE_HASH_NAME = /^(disk|file|device|dspare|mirror|raidz|draid|replacing|spare|indirect|hole|missing)-[0-9a-f]{8}$/;
+// Disks: only multipath user_friendly_names; a custom alias is hashed by the agent.
+const STORAGE_ALIAS_NAME = /^mpath[a-z]{1,4}$/;
+// File basenames: a short local name...
 const STORAGE_LOCAL_NAME = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
 // ...that does not look like a device identifier (by-id prefixes, WWNs, EUIs,
 // long hex, serial-like runs) or an unstable dm-N. Mirrored in the agent.
 const STORAGE_IDENTIFIER = /^(?:ata|scsi|sata|sas|wwn|nvme|dm-uuid|dm-name|usb|ide|virtio|mmc|memstick|pci|eui|naa|lvm-pv-uuid|md-uuid|md-name|uuid)[-_.]|0x[0-9a-f]{4,}|[0-9a-f]{12,}|^dm-[0-9]+$/i;
-function storageSerialLike(name) {return (name.match(/[A-Za-z0-9]{8,}/g)||[]).some(run=>(run.match(/[0-9]/g)||[]).length>=2 && (run.match(/[A-Za-z]/g)||[]).length>=2);}
+// Serial- or model-like: letter/digit runs, also across - _ . : separators.
+function storageSerialLike(name) {
+  const compact=name.replace(/[-_.:]/g,''), runs=[...(name.match(/[A-Za-z0-9]{8,}/g)||[]),...(compact.match(/[A-Za-z0-9]{8,}/g)||[])];
+  return runs.some(run=>(run.match(/[0-9]/g)||[]).length>=2 && (run.match(/[A-Za-z]/g)||[]).length>=2) || /[0-9]{8,}/.test(compact);
+}
+// Mirrored exactly by the agent's name_allowed(); a parity test keeps them identical.
 function storageVdevNameAllowed(type,name) {
-  if(STORAGE_HASH_NAME.test(name))return name.startsWith((type==='unknown'?'device':type)+'-') || type==='unknown';
+  if(typeof name!=='string')return false;
+  const hashed=name.match(STORAGE_HASH_NAME);
+  if(hashed)return hashed[1]===(type==='unknown'?'device':type);
   if(['mirror','raidz','draid','replacing','spare','indirect','hole','missing'].includes(type))return STORAGE_GROUP_NAME.test(name);
-  if(STORAGE_KERNEL_NAME.test(name))return ['disk','dspare','unknown'].includes(type);
-  if(!['disk','file','dspare','unknown'].includes(type) || !STORAGE_LOCAL_NAME.test(name))return false;
-  return !STORAGE_IDENTIFIER.test(name) && !storageSerialLike(name);
+  if(['disk','dspare','unknown'].includes(type))return STORAGE_KERNEL_NAME.test(name) || STORAGE_ALIAS_NAME.test(name);
+  if(type==='file')return STORAGE_LOCAL_NAME.test(name) && !STORAGE_KERNEL_NAME.test(name) && !STORAGE_IDENTIFIER.test(name) && !storageSerialLike(name);
+  return false;
 }
 const STORAGE_TIME = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/;
 function storageEnabled(env) {return env.AUTH_MODE==='standalone';}
@@ -49,7 +61,8 @@ function storageBytes(value,what) {return value===null?null:storageCount(value,w
 function storagePercent(value,what) {if(value!==null && (!Number.isSafeInteger(value) || value<0 || value>100))storageInvalid(what);return value;}
 function storageTime(value,what) {if(value!==null && (typeof value!=='string' || !STORAGE_TIME.test(value) || !Number.isFinite(Date.parse(value))))storageInvalid(what);return value;}
 // Lengths are UTF-16 code units (JavaScript's String length); the agent measures the same unit.
-function storageText(value,max,what) {if(typeof value!=='string' || !value.length || value.length>max || /[\x00-\x1f\x7f]/.test(value))storageInvalid(what);return value;}
+// C0/C1 controls, zero-width and bidirectional controls are rejected (the agent never sends them).
+function storageText(value,max,what) {if(typeof value!=='string' || !value.length || value.length>max || /[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/.test(value))storageInvalid(what);return value;}
 function validatedVdev(node,names,depth,counter) {
   storageObject(node,'vdev');
   if(depth>STORAGE_LIMITS.depth)storageInvalid('vdev tree too deep');
@@ -91,12 +104,11 @@ function validatedPool(pool,seen) {
   if(!Array.isArray(pool.vdevs) || pool.vdevs.length!==1 || typeof pool.vdevsTruncated!=='boolean')storageInvalid('pool vdevs');
   if(pool.vdevs[0]?.type!=='root' || pool.vdevs[0]?.name!==pool.name)storageInvalid('pool root vdev');
   const root=validatedVdev(pool.vdevs[0],new Set(),0,{count:0});
-  const errors=storageObject(pool.errors,'pool errors'), nodes=storageNodes(root), totals={};
+  const errors=storageObject(pool.errors,'pool errors'), totals={};
   for(const key of ['read','write','checksum']) {
     totals[key]=storageCount(errors[key],'pool '+key+' errors');
-    // Totals sum the agent's full tree; a pruned tree can only show less, never more.
-    const shown=nodes.reduce((sum,node)=>sum+node[key],0);
-    if(pool.vdevsTruncated?shown>totals[key]:shown!==totals[key])storageInvalid('pool error totals');
+    // Pool totals are the root vdev's own counters (zpool status's pool line); the root is never pruned.
+    if(totals[key]!==root[key])storageInvalid('pool error totals');
   }
   const size=storageBytes(pool.size,'pool size'), allocated=storageBytes(pool.allocated,'pool allocated'), free=storageBytes(pool.free,'pool free');
   const capacity=storagePercent(pool.capacityPercent,'pool capacity');
