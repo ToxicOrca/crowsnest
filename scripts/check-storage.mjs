@@ -20,28 +20,7 @@ const originalFetch=globalThis.fetch;
 globalThis.fetch=async(url,options)=>{requests.push(JSON.parse(options.body));return new Response(JSON.stringify({id:'test-message',event:'message',topic:'fleet'}));};
 
 // Reports come from the real agent over every fixture, so agent and server must agree.
-const agentReports=JSON.parse(spawnSync('python3',['-I','-c',`
-import importlib.util, json, sys
-from pathlib import Path
-spec = importlib.util.spec_from_file_location('agent', 'storage-agent/crowsnest_storage.py')
-agent = importlib.util.module_from_spec(spec); spec.loader.exec_module(agent)
-version = Path('scripts/fixtures/zfs/captured/zpool-version.txt').read_bytes()
-reports = {}
-for status in sorted(Path('scripts/fixtures/zfs').rglob('*status.json')):
-    listing = status.with_name(status.name.replace('status', 'list'))
-    datasets = status.with_name('zfs-list.json')
-    def run(program, arguments, status=status, listing=listing, datasets=datasets):
-        if arguments == ('--version',): return version
-        if program == 'zfs':
-            if datasets.exists(): return datasets.read_bytes()
-            raise agent.AgentError('command_failed')
-        return (status if arguments == agent.ZPOOL_STATUS else listing).read_bytes()
-    agent.run_command = run
-    namer = agent.DeviceNamer('5a' * 32, dev_root='/nonexistent', sys_root='/nonexistent')
-    storage, error = agent.collect({}, run=run, namer=namer)
-    reports[status.parent.name + '/' + status.name.split('.')[0]] = json.loads(agent.encode_report(storage)[0])
-print(json.dumps(reports))
-`],{encoding:'utf8'}).stdout);
+import {agentReports} from './storage-fixtures.mjs';
 const fixture=name=>clone(agentReports[name]);
 const scenario=name=>fixture('captured-scenarios/'+name);
 assert.equal(Object.keys(agentReports).length,22);
@@ -343,7 +322,9 @@ print(json.dumps(out))`,JSON.stringify([...accepted,...rejected])],{encoding:'ut
   const alerts=()=>requests.map(r=>r.message);
   age(150);age(150,docker.hostId);requests.length=0;await sweep();
   assert.ok(alerts().some(m=>m.startsWith('docker-1\nAlert: No collector report for more than two minutes')),alerts().join('|'));
-  assert.ok(!alerts().some(m=>m.startsWith('nas\n')),'storage agent is not stale at 150 s');
+  assert.ok(!alerts().some(m=>m.startsWith('nas\n') && m.includes('No storage agent report')),'storage agent is not stale at 150 s: '+alerts().join('|'));
+  // The storage alerts just sent start the normal 30 s delivery backoff.
+  const sent=read('notifications/hosts/'+id+'.json');sent.nextAttemptAt=0;set('notifications/hosts/'+id+'.json',sent);
   age(200);requests.length=0;await sweep();
   assert.ok(alerts().some(m=>m==='nas\nAlert: No storage agent report for more than three minutes'),alerts().join('|'));
   // At 150 s a storage agent is fresh again, so the recovery is announced, not suppressed as stale.

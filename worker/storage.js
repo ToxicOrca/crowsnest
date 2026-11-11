@@ -253,10 +253,17 @@ async function recordStorageState(bucket,id,report) {
     if(saved.at && Date.parse(saved.at)>Date.parse(report.receivedAt))return;
     const pools={};
     for(const pool of report.storage.pools) {
-      const remembered=saved.pools?.[pool.name]?.lastScrub||null, scan=pool.scan;
+      const prior=saved.pools?.[pool.name], remembered=prior?.lastScrub||null, scan=pool.scan;
       const completed=scan && scan.type==='scrub' && scan.state==='finished' && scan.endTime?{endTime:scan.endTime,errors:scan.errors,repairedBytes:scan.repairedBytes}:null;
-      pools[pool.name]={lastScrub:completed && (!remembered || Date.parse(completed.endTime)>=Date.parse(remembered.endTime))?completed:remembered};
+      // firstSeen starts the scrub-age clock for a pool whose last scrub the server never saw.
+      pools[pool.name]={lastScrub:completed && (!remembered || Date.parse(completed.endTime)>=Date.parse(remembered.endTime))?completed:remembered,
+        firstSeen:prior?.firstSeen||report.receivedAt,lastSeen:report.receivedAt};
     }
+    // A pool missing from one report (exported, not yet imported) keeps what the
+    // server remembers about it; at most STORAGE_LIMITS.pools absent pools, most recent first.
+    const absent=Object.entries(saved.pools||{}).filter(([name,entry])=>!pools[name] && entry && typeof entry==='object')
+      .sort(([,a],[,b])=>(Date.parse(b.lastSeen||saved.at)||0)-(Date.parse(a.lastSeen||saved.at)||0)).slice(0,STORAGE_LIMITS.pools);
+    for(const [name,entry] of absent)pools[name]={lastScrub:entry.lastScrub||null,firstSeen:entry.firstSeen||saved.at||report.receivedAt,lastSeen:entry.lastSeen||saved.at||report.receivedAt};
     // The last successful pools are the baseline for the next report's activity.
     const value=JSON.stringify({at:report.receivedAt,pools,baseline:report.storage.pools});
     if(object && value===JSON.stringify(saved))return;
@@ -270,4 +277,99 @@ function storageScrubStatus(pool,remembered) {
   if(pool.scan===null)return {status:'never'};
   if(remembered?.lastScrub)return {status:'known',...remembered.lastScrub};
   return {status:'unknown'};
+}
+// Storage alerts. Every rule is on by default: a storage host exists only when the
+// operator installed the agent, and no Docker host is affected. Thresholds are configurable.
+const STORAGE_ALERT_DEFAULTS = {storagePoolAlerts:true,storageVdevAlerts:true,storageErrorAlerts:true,storageScrubErrorAlerts:true,
+  storageScrubAgeAlerts:true,storageScrubDays:35,storageCapacityAlerts:true,storageCapacityWarn:80,storageCapacityHigh:90};
+const STORAGE_ALERT_NUMBERS = {storageScrubDays:[1,365],storageCapacityWarn:[50,99],storageCapacityHigh:[51,100]};
+// Issue ids are zfs:<rule>:<pool>[/<vdev>]; pool and vdev names never contain '/'.
+const STORAGE_ALERT_KINDS = {agent:'hostReports',pool:'storagePoolAlerts',vdev:'storageVdevAlerts',errors:'storageErrorAlerts','data-errors':'storageErrorAlerts',
+  'scrub-errors':'storageScrubErrorAlerts','scrub-age':'storageScrubAgeAlerts',capacity:'storageCapacityAlerts'};
+// Capacity hysteresis: a delivered capacity alert holds until usage drops this many points below its threshold.
+const STORAGE_CAPACITY_SLACK = 2;
+function validStorageAlertSettings(data) {
+  return Object.keys(STORAGE_ALERT_DEFAULTS).filter(k=>!STORAGE_ALERT_NUMBERS[k]).every(k=>data[k]===undefined || typeof data[k]==='boolean') &&
+    Object.entries(STORAGE_ALERT_NUMBERS).every(([k,[min,max]])=>data[k]===undefined || Number.isSafeInteger(data[k]) && data[k]>=min && data[k]<=max);
+}
+function storageAlertRule(id) {return typeof id==='string'?(/^zfs:([a-z-]+):/.exec(id)||[])[1]:undefined;}
+function storageAlertKind(id) {return STORAGE_ALERT_KINDS[storageAlertRule(id)];}
+// Counter and capacity alerts can change often; they share the signal cooldown.
+function storageAlertCooled(id) {return ['errors','data-errors','capacity'].includes(storageAlertRule(id));}
+// Alerts whose counters only fall on zpool clear, a reboot or a later scrub: a decrease is a new baseline.
+function storageAlertCounted(id) {return ['errors','data-errors'].includes(storageAlertRule(id));}
+// Thresholds an alert's meaning depends on: a change retires those alerts silently, never as a recovery.
+function storageAlertThresholds(settings) {return {capacity:[settings.storageCapacityWarn,settings.storageCapacityHigh],'scrub-age':[settings.storageScrubDays]};}
+function storageVdevUnhealthy(node) {
+  if(node.type==='root' || node.state==='ONLINE')return false;
+  if(node.class==='spare' && node.state==='AVAIL')return false;  // An idle hot spare is healthy.
+  // A DEGRADED group is explained by a child that alerts on its own.
+  return !(STORAGE_GROUP_TYPES.has(node.type) && node.state==='DEGRADED');
+}
+function storageVdevLabel(pool,node) {
+  const role={special:'special',dedup:'dedup',log:'log',l2cache:'cache',spare:'spare'}[node.class];
+  return pool.name+'/'+node.name+(role?' ('+role+')':'');
+}
+// Current storage issues for a fresh report. `delivered` is the last delivered baseline;
+// `state` is storage/<id> (remembered scrubs and when each pool was first seen).
+function storageIssues(snapshot,state,settings,delivered,now) {
+  const issues={}, uncertain=new Set(), high=new Set(), low=new Set(), counters={}, storage=snapshot.storage;
+  if(storage.state==='error') {
+    if(settings.hostReports)issues['zfs:agent:']='Storage agent cannot read ZFS ('+storage.error+')';
+    // Pool status is unknown, not recovered: keep every delivered pool alert.
+    for(const id of Object.keys(delivered))if(storageAlertRule(id) && storageAlertRule(id)!=='agent')uncertain.add(id);
+    return {issues,uncertain,high,low,counters};
+  }
+  for(const pool of storage.pools) {
+    const name=pool.name;
+    if(settings.storagePoolAlerts && pool.state!=='ONLINE'){issues['zfs:pool:'+name]=name+': pool is '+pool.state;high.add('zfs:pool:'+name);}
+    // Permanent data errors can sit in an ONLINE pool whose vdev counters were cleared.
+    if(settings.storageErrorAlerts && pool.dataErrors) {
+      issues['zfs:data-errors:'+name]=name+': '+pool.dataErrors+' permanent data error(s); zpool status -v lists the affected files';
+      counters['zfs:data-errors:'+name]={data:pool.dataErrors};
+    }
+    const nodes=storageNodes(pool.vdevs[0]), present=new Set(nodes.map(node=>node.type==='root'?name:name+'/'+node.name));
+    for(const node of nodes) {
+      const target=node.type==='root'?name:name+'/'+node.name, label=node.type==='root'?name:storageVdevLabel(pool,node);
+      if(settings.storageVdevAlerts && storageVdevUnhealthy(node))issues['zfs:vdev:'+target]=label+': '+node.state;
+      if(settings.storageErrorAlerts && (node.read || node.write || node.checksum)) {
+        issues['zfs:errors:'+target]=label+': read '+node.read+', write '+node.write+', checksum '+node.checksum+' error(s)';
+        counters['zfs:errors:'+target]={read:node.read,write:node.write,checksum:node.checksum};
+      }
+    }
+    // A pruned tree omits only healthy vdevs, but absence alone proves nothing: keep those alerts.
+    if(pool.vdevsTruncated)for(const id of Object.keys(delivered))if(['vdev','errors'].includes(storageAlertRule(id)) && id.split(':').slice(2).join(':').startsWith(name+'/') && !present.has(id.split(':').slice(2).join(':')))uncertain.add(id);
+    const remembered=state?.pools?.[name], scrub=storageScrubStatus(pool,remembered);
+    if(settings.storageScrubErrorAlerts && scrub.status==='known' && (scrub.errors>0 || scrub.repairedBytes>0))
+      issues['zfs:scrub-errors:'+name]=name+': scrub finished '+scrub.endTime+' repaired '+storageByteText(scrub.repairedBytes||0)+' with '+scrub.errors+' error(s)';
+    const scrubbing=pool.scan?.type==='scrub' && pool.scan.state==='scanning', limit=settings.storageScrubDays*86400000;
+    if(settings.storageScrubAgeAlerts) {
+      const id='zfs:scrub-age:'+name;
+      // A running scrub is the remedy: no new alert starts, and a delivered one clears only when it finishes.
+      if(scrubbing){if(delivered[id])uncertain.add(id);}
+      else if(scrub.status==='known'){if(now-Date.parse(scrub.endTime)>limit){issues[id]=name+': last completed scrub ('+scrub.endTime+') is older than '+settings.storageScrubDays+' days';low.add(id);}}
+      // "never" (ZFS has no scan record) and "unknown" (the server never saw one finish)
+      // alert only once the server itself has watched the pool for the whole period.
+      else if(remembered?.firstSeen && now-Date.parse(remembered.firstSeen)>limit){issues[id]=name+': '+(scrub.status==='never'?'never scrubbed':'no completed scrub seen')+' in '+settings.storageScrubDays+' days';low.add(id);}
+    }
+    if(settings.storageCapacityAlerts) {
+      const id='zfs:capacity:'+name, was=delivered[id], cap=pool.capacityPercent;
+      if(cap===null){if(was)uncertain.add(id);}
+      else {
+        const band=was?.endsWith('(high)')?'high':was?.endsWith('(warning)')?'warning':null;
+        if(cap>=settings.storageCapacityHigh || band==='high' && cap>=settings.storageCapacityHigh-STORAGE_CAPACITY_SLACK){issues[id]=name+': capacity reached '+settings.storageCapacityHigh+'% (high)';high.add(id);}
+        else if(cap>=settings.storageCapacityWarn || band && cap>=settings.storageCapacityWarn-STORAGE_CAPACITY_SLACK){issues[id]=name+': capacity reached '+settings.storageCapacityWarn+'% (warning)';low.add(id);}
+      }
+    }
+  }
+  return {issues,uncertain,high,low,counters};
+}
+function storageRecoveryText(id,snapshot) {
+  const rule=storageAlertRule(id), target=id.split(':').slice(2).join(':'), [name,vdev]=target.split('/');
+  if(rule==='agent')return 'Storage agent can read ZFS again';
+  const pool=snapshot?.storage?.pools?.find(p=>p.name===name);
+  if(!pool)return name+': pool no longer reported; check the dashboard';
+  if(vdev!==undefined && !storageNodes(pool.vdevs[0]).some(node=>node.name===vdev))return target+': vdev no longer reported; check the dashboard';
+  return target+': '+({pool:'pool is ONLINE again','data-errors':'no permanent data errors reported',vdev:'vdev is healthy again',errors:'error counters cleared (zpool clear or reboot)',
+    'scrub-errors':'a later scrub finished without repairs or errors','scrub-age':'scrubbed recently',capacity:'capacity back below the alert threshold'})[rule];
 }

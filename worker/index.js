@@ -229,10 +229,11 @@ export default {async scheduled(controller,env,ctx) {ctx.waitUntil(sweepNotifica
       if(path==='/api/notifications' && request.method==='PATCH') {
         let data;try{data=await readJson(request,1024);}catch{return json({error:'Invalid settings'},400);}
         const booleanFields=['enabled','recoveries','hostReports','unhealthy','restarting','dead'];
-        if(typeof data.enabled!=='boolean' || typeof data.recoveries!=='boolean' || booleanFields.some(k=>data[k]!==undefined && typeof data[k]!=='boolean') || Object.keys(data).some(k=>![...booleanFields,'staleMinutes','priority',...Object.keys(SIGNAL_DEFAULTS)].includes(k)) || data.staleMinutes!==undefined && ![2,5,10,15].includes(data.staleMinutes) || data.priority!==undefined && ![3,4,5].includes(data.priority) || !validSignalSettings(data))return json({error:'Choose valid notification thresholds, durations, delay, and priority'},400);
+        if(typeof data.enabled!=='boolean' || typeof data.recoveries!=='boolean' || booleanFields.some(k=>data[k]!==undefined && typeof data[k]!=='boolean') || Object.keys(data).some(k=>![...booleanFields,'staleMinutes','priority',...Object.keys(SIGNAL_DEFAULTS),...Object.keys(STORAGE_ALERT_DEFAULTS)].includes(k)) || data.staleMinutes!==undefined && ![2,5,10,15].includes(data.staleMinutes) || data.priority!==undefined && ![3,4,5].includes(data.priority) || !validSignalSettings(data) || !validStorageAlertSettings(data))return json({error:'Choose valid notification thresholds, durations, delay, and priority'},400);
         if(data.enabled && !ntfyDestination(env.NTFY_URL))return json({error:'Configure NTFY_URL in the Crowsnest runtime first'},409);
-        const previous=await notificationSettings(env);
-        await env.BUCKET.put('notifications/settings.json',JSON.stringify({...previous,...data}));
+        const previous=await notificationSettings(env), merged={...previous,...data};
+        if(merged.storageCapacityWarn>=merged.storageCapacityHigh)return json({error:'The capacity warning threshold must be below the high threshold'},400);
+        await env.BUCKET.put('notifications/settings.json',JSON.stringify(merged));
         return json(await notificationStatus(env));
       }
       if(path==='/api/notifications/test' && request.method==='POST') {

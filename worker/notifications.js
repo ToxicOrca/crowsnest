@@ -10,7 +10,7 @@ function ntfyDestination(value) {
 }
 async function notificationSettings(env) {
   const object=await env.BUCKET.get('notifications/settings.json');
-  return {...{enabled:env.NTFY_ENABLED==='true',recoveries:true,hostReports:true,unhealthy:true,restarting:true,dead:true,staleMinutes:2,priority:4},...SIGNAL_DEFAULTS,...object?await object.json():{}};
+  return {...{enabled:env.NTFY_ENABLED==='true',recoveries:true,hostReports:true,unhealthy:true,restarting:true,dead:true,staleMinutes:2,priority:4},...SIGNAL_DEFAULTS,...STORAGE_ALERT_DEFAULTS,...object?await object.json():{}};
 }
 async function hostMaintenance(bucket,id) {
   const object=await bucket.get('maintenance/hosts/'+id+'.json');
@@ -41,6 +41,7 @@ function issueKinds(container) {
 }
 function deliveredIssueKinds(id,text,saved) {
   if(signalKind(id))return [signalKind(id)];
+  if(storageAlertKind(id))return [storageAlertKind(id)];
   if(id==='report')return ['hostReports'];
   if(saved.kinds?.[id])return saved.kinds[id];
   const match=text.match(/: ([^/]+)\/([^/]+)$/);
@@ -110,17 +111,35 @@ async function notifyHostUnlocked(env,host,snapshot,settings,now=Date.now()) {
     const kinds=deliveredIssueKinds(id,text,saved);
     if(!kinds.length || !kinds.some(kind=>settings[kind]))delete saved.delivered[id];
   }
+  // A changed storage threshold retires the alerts that depend on it, like a signal policy change.
+  const thresholds=storageAlertThresholds(settings);
+  for(const [rule,values] of Object.entries(thresholds))if(saved.storageThresholds && JSON.stringify(saved.storageThresholds[rule])!==JSON.stringify(values))
+    for(const id of new Set([...Object.keys(saved.delivered),...Object.keys(saved.cooldowns||{})]))if(storageAlertRule(id)===rule){delete saved.delivered[id];delete saved.cooldowns?.[id];}
+  saved.storageThresholds=thresholds;
   const current=notificationIssues(host,snapshot,now,settings), added=[], removed=[],addedIds=[];
   const observations=settings.cpuAlerts || settings.memoryAlerts || settings.restartBursts?await env.BUCKET.get('signals/'+host.id+'.json'):null;
   const advanced=advancedIssues(snapshot,observations?await observations.json():null,settings);
   Object.assign(current,advanced.issues);
   for(const id of advanced.uncertain)if(saved.delivered[id])current[id]=saved.delivered[id];
+  let storage=null;
+  saved.storageCounters??={};
+  if(host.kind==='storage' && snapshot?.storage && now-Date.parse(snapshot.receivedAt)<=staleAfterMs(host)) {
+    const state=await env.BUCKET.get('storage/'+host.id+'.json');
+    storage=storageIssues(snapshot,state?await state.json():null,settings,saved.delivered,now);
+    Object.assign(current,storage.issues);
+    for(const id of storage.uncertain)if(saved.delivered[id])current[id]=saved.delivered[id];
+    // Counters only fall on zpool clear, a reboot or a later scrub: a decrease is a new baseline, never an alert.
+    for(const [id,counts] of Object.entries(storage.counters)) {
+      const old=saved.storageCounters[id];
+      if(saved.delivered[id] && old && Object.keys(counts).every(key=>counts[key]<=old[key])){saved.delivered[id]=current[id];saved.storageCounters[id]=counts;}
+    }
+  }
   const blocked=[];
   for(const [id,text] of Object.entries(current))if(saved.delivered[id]!==text) {
-    if(signalKind(id) && (saved.cooldowns?.[id]||0)+settings.cooldownMinutes*60000>now)blocked.push(id);
+    if((signalKind(id) || storageAlertCooled(id)) && (saved.cooldowns?.[id]||0)+settings.cooldownMinutes*60000>now)blocked.push(id);
     else{added.push(text);addedIds.push(id);}
   }
-  for(const [id,text] of Object.entries(saved.delivered))if(!current[id])removed.push(id==='report'?(snapshot?'Collector reporting resumed':'Report warning cleared'):text.split(': ')[0]+': '+(signalKind(id)?({cpu:'CPU',memory:'Memory',burst:'Restart burst'})[id.split(':')[0]]+' alert cleared on a fresh report':'no longer in an alert state or no longer reported; check the dashboard'));
+  for(const [id,text] of Object.entries(saved.delivered))if(!current[id])removed.push(id==='report'?(snapshot?(host.kind==='storage'?'Storage agent':'Collector')+' reporting resumed':'Report warning cleared'):storageAlertRule(id)?storageRecoveryText(id,snapshot):text.split(': ')[0]+': '+(signalKind(id)?({cpu:'CPU',memory:'Memory',burst:'Restart burst'})[id.split(':')[0]]+' alert cleared on a fresh report':'no longer in an alert state or no longer reported; check the dashboard'));
   // Suppress stale container recovery messages while their host cannot report.
   const stale=!snapshot || now-Date.parse(snapshot.receivedAt)>staleAfterMs(host);
   if(stale)removed.length=0;
@@ -129,18 +148,23 @@ async function notifyHostUnlocked(env,host,snapshot,settings,now=Date.now()) {
   for(const id of blocked)delete baseline[id];
   const kinds={...stale?saved.kinds||{}:{},...Object.fromEntries((snapshot?.containers||[]).filter(c=>current[c.id]).map(c=>[c.id,issueKinds(c)])),...current.report?{report:['hostReports']}: {}};
   for(const id of Object.keys(current))if(signalKind(id))kinds[id]=[signalKind(id)];
+  // Counters stay with the alert text they were delivered with (the text carries all three counts).
+  const counters=Object.fromEntries(Object.keys(baseline).filter(storageAlertCounted)
+    .map(id=>[id,baseline[id]===current[id] && storage?.counters[id]?storage.counters[id]:saved.storageCounters[id]]).filter(([,value])=>value));
   const lines=[...added.map(x=>'Alert: '+x),...(settings.recoveries?removed.map(x=>'Cleared: '+x):[])];
-  if(!lines.length){saved.delivered=baseline;saved.kinds=kinds;saved.attempts=0;await env.BUCKET.put(key,JSON.stringify(saved));return {sent:0,pending:blocked.length?1:0};}
+  if(!lines.length){saved.delivered=baseline;saved.kinds=kinds;saved.storageCounters=counters;saved.attempts=0;await env.BUCKET.put(key,JSON.stringify(saved));return {sent:0,pending:blocked.length?1:0};}
   if(saved.nextAttemptAt>now)return {sent:0,pending:1};
   let message=host.name+'\n'+lines.slice(0,10).map(x=>x.slice(0,280)).join('\n')+(lines.length>10?'\n'+(lines.length-10)+' more changes. Open Crowsnest for details.':'');
   while(new TextEncoder().encode(message).length>3500)message=message.slice(0,-1);
   try {
     const targets=[...addedIds,...Object.keys(saved.delivered).filter(id=>!current[id])].map(id=>signalContainer(id)||(/^[a-f0-9]{64}$/.test(id)?id:null));
     const container=targets.length && targets.every(id=>id && id===targets[0])?targets[0]:null;
-    await publishNtfy(env,destination,message,'Crowsnest · '+host.name,added.length?settings.priority:3,added.length>0,notificationLink(env,host.id,container));
-    saved.delivered=baseline;saved.kinds=kinds;saved.attempts=0;saved.nextAttemptAt=now+30000;
+    // A pool that is not ONLINE, or high capacity, is at least high priority; warnings alone are default priority.
+    const priority=!added.length?3:addedIds.some(id=>storage?.high.has(id))?Math.max(settings.priority,4):addedIds.every(id=>storage?.low.has(id))?3:settings.priority;
+    await publishNtfy(env,destination,message,'Crowsnest · '+host.name,priority,added.length>0,notificationLink(env,host.id,container));
+    saved.delivered=baseline;saved.kinds=kinds;saved.storageCounters=counters;saved.attempts=0;saved.nextAttemptAt=now+30000;
     saved.cooldowns=Object.fromEntries(Object.entries(saved.cooldowns||{}).filter(([,at])=>now-at<3600000));
-    for(const id of addedIds)if(signalKind(id))saved.cooldowns[id]=now;
+    for(const id of addedIds)if(signalKind(id) || storageAlertCooled(id))saved.cooldowns[id]=now;
     await env.BUCKET.put(key,JSON.stringify(saved));return {sent:1,pending:0};
   }catch {
     saved.attempts=Math.min((saved.attempts||0)+1,6);
