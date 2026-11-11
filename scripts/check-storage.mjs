@@ -44,7 +44,7 @@ print(json.dumps(reports))
 `],{encoding:'utf8'}).stdout);
 const fixture=name=>clone(agentReports[name]);
 const scenario=name=>fixture('captured-scenarios/'+name);
-assert.equal(Object.keys(agentReports).length,16);
+assert.equal(Object.keys(agentReports).length,22);
 
 try {
   // Sites (R2) keeps its existing behavior: storage hosts are standalone-only.
@@ -105,7 +105,7 @@ try {
   const withDatasets=fixture('captured/zpool-status');
   assert.equal(reason(clone(base)),null);assert.equal(reason(clone(withDatasets)),null);
   const chain=r=>{const mirror=root(r).children[0], bottom=mirror.children[0];let node=mirror;
-    for(let i=0;i<6;i++){const next={name:'mirror-'+(10+i),type:'mirror',state:'ONLINE',read:0,write:0,checksum:0,children:[]};if(node===mirror)mirror.children[0]=next;else node.children=[next];node=next;}
+    for(let i=0;i<6;i++){const next={name:'mirror-'+(10+i),type:'mirror',class:'normal',state:'ONLINE',read:0,write:0,checksum:0,children:[]};if(node===mirror)mirror.children[0]=next;else node.children=[next];node=next;}
     node.children=[bottom];};
   const invalid=[
     ['agent version',r=>{r.agentVersion='1.0';},'agent version'],['protocol',r=>{r.agentProtocol=0;},'agent protocol'],['missing storage',r=>{delete r.storage;},'storage section'],
@@ -117,10 +117,11 @@ try {
     ['duplicate vdev names',r=>{leaf(r).name='disk4';},'duplicate vdev name'],['vdev name',r=>{leaf(r).name='/dev/sda';},'vdev name'],['vdev type',r=>{leaf(r).type='tape';},'vdev type or state'],
     ['vdev state',r=>{leaf(r).state='fine';},'vdev type or state'],['children on a leaf',r=>{leaf(r).children=[];},'vdev children'],['negative counter',r=>{leaf(r).read=-1;},'read errors'],
     ['unsafe integer',r=>{leaf(r).write=2**53;pool(r).errors.write=2**53;},'write errors'],
-    ['too many vdevs',r=>{root(r).children[0].children=Array.from({length:130},(_,i)=>({name:'sd'+String.fromCharCode(97+i%26)+String.fromCharCode(97+Math.floor(i/26)),type:'disk',state:'ONLINE',read:0,write:0,checksum:0}));},'too many vdevs'],
+    ['too many vdevs',r=>{root(r).children[0].children=Array.from({length:130},(_,i)=>({name:'sd'+String.fromCharCode(97+i%26)+String.fromCharCode(97+Math.floor(i/26)),type:'disk',class:'normal',state:'ONLINE',read:0,write:0,checksum:0}));},'too many vdevs'],
     ['too deep',chain,'vdev tree too deep'],
     ['root name',r=>{root(r).name='other';},'pool root vdev'],['root type',r=>{root(r).type='mirror';},'pool root vdev'],['two roots',r=>{pool(r).vdevs.push(clone(root(r)));},'pool vdevs'],
     ['nested root',r=>{root(r).children[0].type='root';},'pool root vdev'],
+    ['vdev class',r=>{leaf(r).class='tape-library';},'vdev class'],['root class',r=>{root(r).class='special';},'vdev class'],
     ['totals mismatch',r=>{pool(r).errors.checksum=3;},'pool error totals'],['truncated shows more',r=>{pool(r).vdevsTruncated=true;pool(r).errors.checksum=1;},'pool error totals'],
     ['capacity',r=>{pool(r).capacityPercent=101;},'pool capacity'],['size',r=>{pool(r).size=-5;},'pool size'],
     ['allocated above size',r=>{pool(r).allocated=pool(r).size+1;},'pool sizes'],['allocated plus free above size',r=>{pool(r).free=pool(r).free+4096;},'pool sizes'],
@@ -221,13 +222,19 @@ print(json.dumps(out))`,JSON.stringify([...accepted,...rejected])],{encoding:'ut
   // A pool that degrades while the agent is failing (e.g. zpool status hangs) is still recorded.
   reset();await step(scenario('04-scrub-finished'));await step(failed);
   assert.deepEqual(await step(scenario('05-degraded-offline')),['Storage agent recovered; pool status is available again','zfstest: ONLINE → DEGRADED','zfstest/mirror-0: ONLINE → DEGRADED','zfstest/disk2: ONLINE → OFFLINE']);
+  // Special, log, cache and spare vdevs (zpool status lists them beside the main tree).
+  const classes=name=>fixture('captured-classes/'+name);
+  reset();await step(classes('01-all-healthy'));
+  assert.deepEqual(await step(classes('03-cache-offline')),['zfstest2/cache1: ONLINE → OFFLINE'],'a cache device going offline is recorded while the pool stays ONLINE');
+  reset();await step(classes('01-all-healthy'));
+  assert.deepEqual(await step(classes('04-spare-inuse-resilvering')),['zfstest2: ONLINE → DEGRADED','zfstest2/mirror-0: ONLINE → DEGRADED','zfstest2/spare-1: added (DEGRADED)','zfstest2/d2: ONLINE → OFFLINE','zfstest2/spare1: AVAIL → ONLINE','zfstest2: resilver started'],'the hot spare moves into the tree; it is not reported as removed');
   // Data errors and a scrub that found errors.
   reset();
   await step(fixture('synthetic/scrub-in-progress'));
   assert.deepEqual(await step(fixture('synthetic/checksum-errors')),['tank: permanent data errors 0 → 2','tank/sdd: errors increased (checksum 0 → 17)','tank: scrub finished (repaired 1.0 MiB, 2 error(s))']);
   // A single report is bounded to 20 events plus a summary.
   const wide=clone(fixture('synthetic/scrub-in-progress')), widePool=pool(wide);
-  widePool.vdevs[0].children[0].children=Array.from({length:30},(_,i)=>({name:'sd'+String.fromCharCode(97+i%26)+(i<26?'':'x'),type:'disk',state:'ONLINE',read:0,write:0,checksum:0}));
+  widePool.vdevs[0].children[0].children=Array.from({length:30},(_,i)=>({name:'sd'+String.fromCharCode(97+i%26)+(i<26?'':'x'),type:'disk',class:'normal',state:'ONLINE',read:0,write:0,checksum:0}));
   reset();await step(wide);
   const faulted=clone(wide);for(const disk of pool(faulted).vdevs[0].children[0].children)disk.state='FAULTED';
   const capped=await step(faulted);

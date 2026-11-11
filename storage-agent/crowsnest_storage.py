@@ -42,7 +42,10 @@ ZPOOL_LIST = ('list', '-j', '--json-int')
 ZFS_LIST = ('list', '-j', '--json-int', '-o', 'name,used,avail,refer,quota,mountpoint', '-d', '1')
 
 POOL_STATES = {'ONLINE', 'DEGRADED', 'FAULTED', 'OFFLINE', 'UNAVAIL', 'REMOVED', 'SUSPENDED'}
-VDEV_STATES = POOL_STATES | {'CANT_OPEN', 'CORRUPT_DATA', 'NO_REPLICAS', 'BAD_GUID_SUM', 'TOO_SMALL', 'BAD_LABEL', 'SPLIT'}
+# AVAIL and INUSE are hot-spare states.
+VDEV_STATES = POOL_STATES | {'CANT_OPEN', 'CORRUPT_DATA', 'NO_REPLICAS', 'BAD_GUID_SUM', 'TOO_SMALL', 'BAD_LABEL', 'SPLIT', 'AVAIL', 'INUSE'}
+HEALTHY_STATES = {'ONLINE', 'AVAIL'}  # An available hot spare is healthy.
+VDEV_CLASSES = {'normal', 'special', 'dedup', 'log', 'l2cache', 'spare'}
 GROUP_TYPES = {'root', 'mirror', 'raidz', 'draid', 'replacing', 'spare'}
 LEAF_TYPES = {'disk', 'file', 'dspare', 'indirect', 'hole', 'missing'}
 SCAN_TYPES = {'SCRUB': 'scrub', 'RESILVER': 'resilver', 'ERRORSCRUB': 'errorscrub'}
@@ -236,7 +239,7 @@ class DeviceNamer:
         return candidate
 
 
-def vdev_tree(node, pool_name, namer, depth=0, used=None):
+def vdev_tree(node, pool_name, namer, depth=0, used=None, parent_class='normal'):
     """Allowlisted vdev tree. Names are unique within a pool (alerts key on them)."""
     used = used if used is not None else {}
     if not isinstance(node, dict):
@@ -245,8 +248,11 @@ def vdev_tree(node, pool_name, namer, depth=0, used=None):
         raise AgentError('invalid_output', 'vdev tree too deep')
     name = namer.name(node, pool_name, used)
     vtype, state = node.get('vdev_type'), node.get('state')
+    raw_class = node.get('class', parent_class)
+    vclass = raw_class if raw_class in VDEV_CLASSES else 'other'
     result = {'name': name,
               'type': vtype if vtype in GROUP_TYPES | LEAF_TYPES else 'unknown',
+              'class': vclass,
               'state': state if state in VDEV_STATES else 'UNKNOWN',
               'read': counter(node, 'read_errors'), 'write': counter(node, 'write_errors'),
               'checksum': counter(node, 'checksum_errors')}
@@ -254,7 +260,7 @@ def vdev_tree(node, pool_name, namer, depth=0, used=None):
     if children is not None:
         if not isinstance(children, dict):
             raise AgentError('invalid_output', 'vdev children are not an object')
-        result['children'] = [vdev_tree(child, pool_name, namer, depth + 1, used) for child in children.values()]
+        result['children'] = [vdev_tree(child, pool_name, namer, depth + 1, used, vclass) for child in children.values()]
     return result
 
 
@@ -265,7 +271,27 @@ def walk(node):
 
 
 def attention(node):
-    return node['state'] != 'ONLINE' or node['read'] or node['write'] or node['checksum']
+    return node['state'] not in HEALTHY_STATES or node['read'] or node['write'] or node['checksum']
+
+
+def raw_nodes(node):
+    yield node
+    for child in (node.get('vdevs') or {}).values() if isinstance(node.get('vdevs'), dict) else ():
+        yield from raw_nodes(child)
+
+
+def vdev_sections(pool):
+    """Top-level vdevs outside the main tree: special, logs, l2cache, spares, ...
+
+    `zpool status -j` lists these next to `vdevs`. They are recognized by content
+    (objects of vdevs), not by key name, so a class missing from the captured
+    fixtures is still reported rather than silently dropped.
+    """
+    for key, section in pool.items():
+        if key == 'vdevs' or not isinstance(section, dict) or not section:
+            continue
+        if all(isinstance(top, dict) and 'vdev_type' in top for top in section.values()):
+            yield from section.values()
 
 
 def bounded_tree(root):
@@ -336,7 +362,17 @@ def pools_summary(status, listing, namer):
         roots = pool.get('vdevs')
         if not isinstance(roots, dict) or len(roots) != 1:
             raise AgentError('invalid_output', 'pool needs exactly one root vdev')
-        tree = vdev_tree(next(iter(roots.values())), name, namer)
+        raw_root = next(iter(roots.values()))
+        used = {}
+        tree = vdev_tree(raw_root, name, namer, used=used)
+        tree.setdefault('children', [])
+        # An in-use hot spare appears both inside the tree and in `spares`; report it once.
+        seen = {n.get('guid') for n in raw_nodes(raw_root) if isinstance(n, dict) and isinstance(n.get('guid'), int)}
+        for top in vdev_sections(pool):
+            if isinstance(top.get('guid'), int) and top['guid'] in seen:
+                continue
+            seen.add(top.get('guid'))
+            tree['children'].append(vdev_tree(top, name, namer, depth=1, used=used, parent_class=top.get('class', 'other')))
         nodes = list(walk(tree))
         tree, truncated = bounded_tree(tree)
         properties = (listed.get(name) or {}).get('properties')

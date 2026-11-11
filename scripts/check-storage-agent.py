@@ -79,7 +79,7 @@ class FixtureChecks(unittest.TestCase):
             listing = status.with_name(status.name.replace('status', 'list'))
             self.assertTrue(listing.exists(), listing)
             pairs.append((status, listing))
-        self.assertEqual(len(pairs), 1 + 8 + 7, 'captured host, 8 captured scenarios, 7 synthetic scenarios')
+        self.assertEqual(len(pairs), 1 + 8 + 6 + 7, 'captured host, 8 + 6 captured scenarios, 7 synthetic scenarios')
         for status, listing in pairs:
             with self.subTest(fixture=str(status)):
                 storage, error, body = collect_files(status, listing)
@@ -93,6 +93,7 @@ class FixtureChecks(unittest.TestCase):
                     for key in ('read', 'write', 'checksum'):
                         self.assertEqual(pool['errors'][key], sum(n[key] for n in nodes))
                     for node in nodes:
+                        self.assertIn(node['class'], agent.VDEV_CLASSES, node)
                         self.assertNotEqual(node['type'], 'unknown', node)
                         self.assertNotEqual(node['state'], 'UNKNOWN', node)
                         self.assertRegex(node['name'], r'^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$')
@@ -157,6 +158,48 @@ class FixtureChecks(unittest.TestCase):
         done = self.scenario('07-resilver-finished')
         self.assertEqual((done['state'], done['scan']['state'], done['scan']['resilveredBytes']), ('ONLINE', 'finished', 154008064))
         self.assertNotIn('replacing-1', tree(done))
+
+    def classes(self, name):
+        return collect_files(FIXTURES / 'captured-classes' / (name + '.status.json'),
+                             FIXTURES / 'captured-classes' / (name + '.list.json'))[0]['pools'][0]
+
+    def test_special_log_cache_and_spare_vdevs_are_reported(self):
+        top = lambda pool: [(c['name'], c['type'], c['class'], c['state']) for c in pool['vdevs'][0]['children']]
+        healthy = self.classes('01-all-healthy')
+        # zpool status -j lists these beside `vdevs`; they become top-level children with their class.
+        self.assertEqual(top(healthy), [('mirror-0', 'mirror', 'normal', 'ONLINE'), ('mirror-1', 'mirror', 'special', 'ONLINE'),
+                                        ('log1', 'file', 'log', 'ONLINE'), ('cache1', 'file', 'l2cache', 'ONLINE'), ('spare1', 'file', 'spare', 'AVAIL')])
+        self.assertEqual([c['class'] for c in tree(healthy)['mirror-1']['children']], ['special', 'special'])
+        log = self.classes('02-log-offline')
+        self.assertEqual((log['state'], tree(log)['log1']['state']), ('DEGRADED', 'OFFLINE'))
+        # A cache device going offline leaves the pool ONLINE: only the vdev shows it.
+        cache = self.classes('03-cache-offline')
+        self.assertEqual((cache['state'], tree(cache)['cache1']['state']), ('ONLINE', 'OFFLINE'))
+        for name in ('04-spare-inuse-resilvering', '05-spare-inuse-resilver-finished'):
+            pool = self.classes(name)
+            spare = tree(pool)['spare-1']
+            self.assertEqual([(c['name'], c['class'], c['state']) for c in spare['children']], [('d2', 'normal', 'OFFLINE'), ('spare1', 'spare', 'ONLINE')])
+            # The in-use spare is reported once (inside the tree), not again from `spares`.
+            self.assertEqual([c['name'] for c in pool['vdevs'][0]['children']], ['mirror-0', 'mirror-1', 'log1', 'cache1'])
+        self.assertEqual(self.classes('04-spare-inuse-resilvering')['scan']['resilveredBytes'], 65372160)
+        special = self.classes('06-special-member-offline')
+        self.assertEqual((special['state'], tree(special)['mirror-1']['state'], tree(special)['sp2']['state']), ('DEGRADED', 'DEGRADED', 'OFFLINE'))
+
+    def test_vdev_sections_are_found_by_content_not_key_name(self):
+        status = json.loads((FIXTURES / 'captured-classes/01-all-healthy.status.json').read_text())
+        pool = status['pools']['zfstest2']
+        pool['future_section'] = pool.pop('logs')  # A section name the agent has never seen.
+        pool['future_section']['/var/tmp/fixture-vdevs-2/log1']['class'] = 'newclass'
+        result = agent.pools_summary(status, {'pools': {}}, namer())[0]
+        log = tree(result)['log1']
+        self.assertEqual((log['class'], log['state']), ('other', 'ONLINE'))
+        log_errors = json.loads(json.dumps(status))
+        log_errors['pools']['zfstest2']['future_section']['/var/tmp/fixture-vdevs-2/log1']['write_errors'] = 7
+        self.assertEqual(agent.pools_summary(log_errors, {'pools': {}}, namer())[0]['errors']['write'], 7, 'section vdevs count toward pool totals')
+
+    def test_an_available_spare_is_healthy(self):
+        self.assertFalse(agent.attention({'state': 'AVAIL', 'read': 0, 'write': 0, 'checksum': 0}))
+        self.assertTrue(agent.attention({'state': 'INUSE', 'read': 0, 'write': 0, 'checksum': 0}))
 
     def test_silent_corruption_is_visible_only_in_vdev_counters(self):
         pool = self.scenario('08-checksum-errors-after-scrub')

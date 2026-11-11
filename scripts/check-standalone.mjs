@@ -137,7 +137,7 @@ try {
   const storageReport = {agentVersion: '0.1.0', agentProtocol: 1, storage: {state: 'ok', error: null, zfsVersion: '2.4.1', datasetsStatus: 'disabled', pools: [{
     name: 'tank', state: 'ONLINE', size: 1000, allocated: 400, free: 600, capacityPercent: 40, fragmentationPercent: 3, errors: {read: 0, write: 0, checksum: 0}, dataErrors: 0,
     scan: {type: 'scrub', state: 'finished', startTime: '2026-11-01T00:00:00Z', endTime: '2026-11-01T01:00:00Z', examinedBytes: 400, totalBytes: 400, errors: 0, repairedBytes: 0},
-    vdevs: [{name: 'tank', type: 'root', state: 'ONLINE', read: 0, write: 0, checksum: 0, children: [{name: 'sda', type: 'disk', state: 'ONLINE', read: 0, write: 0, checksum: 0}]}], vdevsTruncated: false}]}};
+    vdevs: [{name: 'tank', type: 'root', class: 'normal', state: 'ONLINE', read: 0, write: 0, checksum: 0, children: [{name: 'sda', type: 'disk', class: 'normal', state: 'ONLINE', read: 0, write: 0, checksum: 0}]}], vdevsTruncated: false}]}};
   assert.equal((await request('/api/ingest/' + storageSetup.hostId, {method: 'POST', signed: false, data: storageReport, headers: {Authorization: 'Bearer ' + storageConfig.hostToken}})).status, 200);
   const storageRows = () => runtime.storage.db.prepare("SELECT key, value, etag FROM objects WHERE key LIKE 'storage%' ORDER BY key").all();
   const storageBefore = storageRows();

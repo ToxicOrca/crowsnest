@@ -11,7 +11,10 @@ const STORAGE_HISTORY_RETENTION = 86400000;
 const STORAGE_HISTORY_READINGS = 288;
 const STORAGE_HISTORY_MAX_BYTES = 262144;
 const STORAGE_POOL_STATES = new Set(['ONLINE','DEGRADED','FAULTED','OFFLINE','UNAVAIL','REMOVED','SUSPENDED','UNKNOWN']);
-const STORAGE_VDEV_STATES = new Set([...STORAGE_POOL_STATES,'CANT_OPEN','CORRUPT_DATA','NO_REPLICAS','BAD_GUID_SUM','TOO_SMALL','BAD_LABEL','SPLIT']);
+// AVAIL and INUSE are hot-spare states.
+const STORAGE_VDEV_STATES = new Set([...STORAGE_POOL_STATES,'CANT_OPEN','CORRUPT_DATA','NO_REPLICAS','BAD_GUID_SUM','TOO_SMALL','BAD_LABEL','SPLIT','AVAIL','INUSE']);
+// Allocation classes: special, dedup, log, cache and spare vdevs sit beside the main tree in ZFS output.
+const STORAGE_VDEV_CLASSES = new Set(['normal','special','dedup','log','l2cache','spare','other']);
 const STORAGE_GROUP_TYPES = new Set(['root','mirror','raidz','draid','replacing','spare','unknown']);
 const STORAGE_VDEV_TYPES = new Set([...STORAGE_GROUP_TYPES,'disk','file','dspare','indirect','hole','missing']);
 const STORAGE_SCAN_TYPES = new Set(['scrub','resilver','errorscrub','other']);
@@ -52,12 +55,13 @@ function validatedVdev(node,names,depth,counter) {
   if(depth>STORAGE_LIMITS.depth)storageInvalid('vdev tree too deep');
   if(++counter.count>STORAGE_LIMITS.vdevsPerPool)storageInvalid('too many vdevs');
   if(!STORAGE_VDEV_TYPES.has(node.type) || !STORAGE_VDEV_STATES.has(node.state))storageInvalid('vdev type or state');
+  if(!STORAGE_VDEV_CLASSES.has(node.class) || depth===0 && node.class!=='normal')storageInvalid('vdev class');
   // Only the top of the tree is a root; it is named after its pool (checked in validatedPool).
   if((node.type==='root')!==(depth===0))storageInvalid('pool root vdev');
   if(typeof node.name!=='string' || node.type!=='root' && !storageVdevNameAllowed(node.type,node.name))storageInvalid('vdev name');
   if(names.has(node.name))storageInvalid('duplicate vdev name');
   names.add(node.name);
-  const vdev={name:node.name,type:node.type,state:node.state,read:storageCount(node.read,'read errors'),write:storageCount(node.write,'write errors'),checksum:storageCount(node.checksum,'checksum errors')};
+  const vdev={name:node.name,type:node.type,class:node.class,state:node.state,read:storageCount(node.read,'read errors'),write:storageCount(node.write,'write errors'),checksum:storageCount(node.checksum,'checksum errors')};
   if(node.children!==undefined) {
     // Leaves (disk, file, ...) never have children in ZFS output.
     if(!STORAGE_GROUP_TYPES.has(node.type) || !Array.isArray(node.children))storageInvalid('vdev children');
