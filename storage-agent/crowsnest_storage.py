@@ -52,13 +52,29 @@ ERROR_CODES = {'zfs_unavailable', 'unsupported_version', 'permission_denied', 'c
 # Kernel block-device names ZFS itself reports (e.g. `sda`), with an optional
 # partition suffix to remove. dm-N is deliberately absent: it is renumbered
 # across reboots and multipath reloads, so it is never used as a name.
-KERNEL_NAME = re.compile(r'(?:(sd[a-z]+|vd[a-z]+|xvd[a-z]+|hd[a-z]+)[0-9]*'
-                         r'|(nvme[0-9]+n[0-9]+|mmcblk[0-9]+|md[0-9]+|loop[0-9]+|nbd[0-9]+|zd[0-9]+|rbd[0-9]+)(?:p[0-9]+)?)')
+# The bases match the dashboard's allowlist (worker/storage.js STORAGE_KERNEL_NAME).
+KERNEL_NAME = re.compile(r'(?:((?:sd|vd|xvd|hd)[a-z]{1,4})[0-9]*'
+                         r'|(nvme[0-9]{1,3}n[0-9]{1,3}|mmcblk[0-9]{1,3}|md[0-9]{1,4}|loop[0-9]{1,4}|nbd[0-9]{1,3}|zd[0-9]{1,5}|rbd[0-9]{1,4})(?:p[0-9]+)?)')
 DM_DEVICE = re.compile(r'dm-[0-9]+')
 NAME_SALT = re.compile(r'[0-9a-f]{64}')
 HASH_LENGTH = 8
-GROUP_NAME = re.compile(r'[a-z][a-z0-9]*(?::[a-z0-9]+)*-[0-9]{1,4}')
+# Same patterns as the dashboard (worker/storage.js); a name the dashboard would
+# reject is never sent: it falls back to the salted hash instead.
+GROUP_NAME = re.compile(r'(?:mirror|raidz[1-3]?|draid[1-3](?::[0-9]{1,3}[dcs]){0,3}|replacing|spare|indirect|hole|missing)-[0-9]{1,4}')
 SAFE_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,63}')
+IDENTIFIER = re.compile(r'^(?:ata|scsi|sata|sas|wwn|nvme|dm-uuid|dm-name|usb|ide|virtio|mmc|memstick|pci|eui|naa|lvm-pv-uuid|md-uuid|md-name|uuid)[-_.]'
+                        r'|0x[0-9a-f]{4,}|[0-9a-f]{12,}|^dm-[0-9]+$', re.I)
+
+
+def serial_like(name):
+    return any(len(re.findall(r'[0-9]', run)) >= 2 and len(re.findall(r'[A-Za-z]', run)) >= 2
+               for run in re.findall(r'[A-Za-z0-9]{8,}', name))
+
+
+def local_name(name):
+    """A multipath alias or file basename that is safe to send as-is."""
+    return (isinstance(name, str) and bool(SAFE_NAME.fullmatch(name))
+            and not IDENTIFIER.search(name) and not serial_like(name))
 POOL_NAME = re.compile(r'[A-Za-z][A-Za-z0-9_.:-]{0,127}')
 
 
@@ -154,7 +170,8 @@ class DeviceNamer:
             return None
         alias, wwid = self._sys(device, 'dm', 'name'), uuid[len('mpath-'):]
         # Without user_friendly_names or an alias the map is named by its WWID: not an alias.
-        if not alias or not wwid or wwid in alias or DM_DEVICE.fullmatch(alias) or not SAFE_NAME.fullmatch(alias):
+        # An alias that looks like a serial, WWN or by-id name is not used either.
+        if not alias or not wwid or wwid in alias or not local_name(alias):
             return None
         return alias
 
@@ -184,7 +201,7 @@ class DeviceNamer:
             return name if isinstance(name, str) and GROUP_NAME.fullmatch(name) else None
         if vtype == 'file':
             base = os.path.basename(name) if isinstance(name, str) else ''
-            return base if SAFE_NAME.fullmatch(base) else None
+            return base if local_name(base) else None
         # By-id names are not resolved to sdX: kernel ordering is not stable either.
         short = kernel_name(name)
         if short:
@@ -345,20 +362,28 @@ def pools_summary(status, listing, namer):
     return result
 
 
-def datasets_summary(listing):
+def utf16_length(text):
+    """Length in UTF-16 code units, the unit the dashboard (JavaScript) measures."""
+    return len(text.encode('utf-16-le', 'surrogatepass')) // 2
+
+
+def datasets_summary(listing, pool_names):
     if not isinstance(listing, dict) or not isinstance(listing.get('datasets', {}), dict):
         raise AgentError('invalid_output', 'zfs list has no datasets object')
-    items = list(listing.get('datasets', {}).items())
+    # Only roots and direct children of pools in this report (`-d 1`; pools can
+    # appear or go between the two commands).
+    items = [(name, dataset) for name, dataset in listing.get('datasets', {}).items()
+             if isinstance(name, str) and name.split('/')[0] in pool_names and name.count('/') <= 1 and not name.endswith('/')]
     result = []
     for name, dataset in items[:MAX_DATASETS]:
         properties = dataset.get('properties') if isinstance(dataset, dict) else None
-        if (not isinstance(name, str) or not 0 < len(name) <= MAX_DATASET_NAME or not name.isprintable()
+        if (not 0 < utf16_length(name) <= MAX_DATASET_NAME or not name.isprintable()
                 or not isinstance(properties, dict)):
             raise AgentError('invalid_output', 'invalid dataset entry')
         mountpoint = (properties.get('mountpoint') or {}).get('value')
         if mountpoint == '-' or mountpoint is None:
             mountpoint = None
-        elif not isinstance(mountpoint, str) or len(mountpoint) > MAX_MOUNTPOINT or not mountpoint.isprintable():
+        elif not isinstance(mountpoint, str) or utf16_length(mountpoint) > MAX_MOUNTPOINT or not mountpoint.isprintable():
             raise AgentError('invalid_output', 'invalid mountpoint')
         quota = list_property(properties, 'quota')
         result.append({'name': name, 'used': list_property(properties, 'used'),
@@ -434,7 +459,7 @@ def collect(config, run=None, run_json_command=None, namer=None):
     if config.get('datasets', True):
         # Optional dataset usage must never prevent pool status.
         try:
-            datasets, truncated = datasets_summary(run_json_command('zfs', ZFS_LIST))
+            datasets, truncated = datasets_summary(run_json_command('zfs', ZFS_LIST), {pool['name'] for pool in storage['pools']})
             storage['datasets'] = datasets
             storage['datasetsStatus'] = 'truncated' if truncated else 'complete'
         except AgentError:

@@ -19,7 +19,24 @@ const STORAGE_SCAN_STATES = new Set(['scanning','finished','canceled','unknown']
 const STORAGE_ERRORS = new Set(['zfs_unavailable','unsupported_version','permission_denied','command_failed','timeout','invalid_output','limit_exceeded','report_limit']);
 const STORAGE_DATASET_STATUS = new Set(['complete','truncated','unavailable','disabled','report_limit']);
 const STORAGE_POOL_NAME = /^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/;
-const STORAGE_VDEV_NAME = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+// Vdev names: the server independently allows only the shapes the agent can emit,
+// per vdev type, so privacy never rests on the agent alone.
+const STORAGE_KERNEL_NAME = /^(?:(?:sd|vd|xvd|hd)[a-z]{1,4}|nvme[0-9]{1,3}n[0-9]{1,3}|mmcblk[0-9]{1,3}|md[0-9]{1,4}|loop[0-9]{1,4}|nbd[0-9]{1,3}|zd[0-9]{1,5}|rbd[0-9]{1,4})$/;
+const STORAGE_GROUP_NAME = /^(?:mirror|raidz[1-3]?|draid[1-3](?::[0-9]{1,3}[dcs]){0,3}|replacing|spare|indirect|hole|missing)-[0-9]{1,4}$/;
+const STORAGE_HASH_NAME = /^(?:disk|file|device|dspare|mirror|raidz|draid|replacing|spare|indirect|hole|missing)-[0-9a-f]{8,64}$/;
+// Multipath aliases and file basenames: a short local name...
+const STORAGE_LOCAL_NAME = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
+// ...that does not look like a device identifier (by-id prefixes, WWNs, EUIs,
+// long hex, serial-like runs) or an unstable dm-N. Mirrored in the agent.
+const STORAGE_IDENTIFIER = /^(?:ata|scsi|sata|sas|wwn|nvme|dm-uuid|dm-name|usb|ide|virtio|mmc|memstick|pci|eui|naa|lvm-pv-uuid|md-uuid|md-name|uuid)[-_.]|0x[0-9a-f]{4,}|[0-9a-f]{12,}|^dm-[0-9]+$/i;
+function storageSerialLike(name) {return (name.match(/[A-Za-z0-9]{8,}/g)||[]).some(run=>(run.match(/[0-9]/g)||[]).length>=2 && (run.match(/[A-Za-z]/g)||[]).length>=2);}
+function storageVdevNameAllowed(type,name) {
+  if(STORAGE_HASH_NAME.test(name))return name.startsWith((type==='unknown'?'device':type)+'-') || type==='unknown';
+  if(['mirror','raidz','draid','replacing','spare','indirect','hole','missing'].includes(type))return STORAGE_GROUP_NAME.test(name);
+  if(STORAGE_KERNEL_NAME.test(name))return ['disk','dspare','unknown'].includes(type);
+  if(!['disk','file','dspare','unknown'].includes(type) || !STORAGE_LOCAL_NAME.test(name))return false;
+  return !STORAGE_IDENTIFIER.test(name) && !storageSerialLike(name);
+}
 const STORAGE_TIME = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/;
 function storageEnabled(env) {return env.AUTH_MODE==='standalone';}
 function storageInvalid(message) {throw new Error('Invalid storage report: '+message);}
@@ -28,13 +45,17 @@ function storageCount(value,what) {if(!Number.isSafeInteger(value) || value<0)st
 function storageBytes(value,what) {return value===null?null:storageCount(value,what);}
 function storagePercent(value,what) {if(value!==null && (!Number.isSafeInteger(value) || value<0 || value>100))storageInvalid(what);return value;}
 function storageTime(value,what) {if(value!==null && (typeof value!=='string' || !STORAGE_TIME.test(value) || !Number.isFinite(Date.parse(value))))storageInvalid(what);return value;}
+// Lengths are UTF-16 code units (JavaScript's String length); the agent measures the same unit.
 function storageText(value,max,what) {if(typeof value!=='string' || !value.length || value.length>max || /[\x00-\x1f\x7f]/.test(value))storageInvalid(what);return value;}
 function validatedVdev(node,names,depth,counter) {
   storageObject(node,'vdev');
   if(depth>STORAGE_LIMITS.depth)storageInvalid('vdev tree too deep');
   if(++counter.count>STORAGE_LIMITS.vdevsPerPool)storageInvalid('too many vdevs');
-  if(typeof node.name!=='string' || !STORAGE_VDEV_NAME.test(node.name) || names.has(node.name))storageInvalid('vdev name');
   if(!STORAGE_VDEV_TYPES.has(node.type) || !STORAGE_VDEV_STATES.has(node.state))storageInvalid('vdev type or state');
+  // Only the top of the tree is a root; it is named after its pool (checked in validatedPool).
+  if((node.type==='root')!==(depth===0))storageInvalid('pool root vdev');
+  if(typeof node.name!=='string' || node.type!=='root' && !storageVdevNameAllowed(node.type,node.name))storageInvalid('vdev name');
+  if(names.has(node.name))storageInvalid('duplicate vdev name');
   names.add(node.name);
   const vdev={name:node.name,type:node.type,state:node.state,read:storageCount(node.read,'read errors'),write:storageCount(node.write,'write errors'),checksum:storageCount(node.checksum,'checksum errors')};
   if(node.children!==undefined) {
@@ -64,8 +85,8 @@ function validatedPool(pool,seen) {
   if(!STORAGE_POOL_STATES.has(pool.state))storageInvalid('pool state');
   seen.add(pool.name);
   if(!Array.isArray(pool.vdevs) || pool.vdevs.length!==1 || typeof pool.vdevsTruncated!=='boolean')storageInvalid('pool vdevs');
+  if(pool.vdevs[0]?.type!=='root' || pool.vdevs[0]?.name!==pool.name)storageInvalid('pool root vdev');
   const root=validatedVdev(pool.vdevs[0],new Set(),0,{count:0});
-  if(root.type!=='root' || root.name!==pool.name)storageInvalid('pool root vdev');
   const errors=storageObject(pool.errors,'pool errors'), nodes=storageNodes(root), totals={};
   for(const key of ['read','write','checksum']) {
     totals[key]=storageCount(errors[key],'pool '+key+' errors');
@@ -73,14 +94,21 @@ function validatedPool(pool,seen) {
     const shown=nodes.reduce((sum,node)=>sum+node[key],0);
     if(pool.vdevsTruncated?shown>totals[key]:shown!==totals[key])storageInvalid('pool error totals');
   }
-  return {name:pool.name,state:pool.state,size:storageBytes(pool.size,'pool size'),allocated:storageBytes(pool.allocated,'pool allocated'),free:storageBytes(pool.free,'pool free'),
-    capacityPercent:storagePercent(pool.capacityPercent,'pool capacity'),fragmentationPercent:storagePercent(pool.fragmentationPercent,'pool fragmentation'),
+  const size=storageBytes(pool.size,'pool size'), allocated=storageBytes(pool.allocated,'pool allocated'), free=storageBytes(pool.free,'pool free');
+  const capacity=storagePercent(pool.capacityPercent,'pool capacity');
+  // Reject impossible sizes only: exact equalities are not relied on for every ZFS layout.
+  if(size!==null && (allocated!==null && allocated>size || free!==null && free>size || allocated!==null && free!==null && allocated+free>size))storageInvalid('pool sizes');
+  if(size && allocated!==null && capacity!==null && Math.abs(capacity-Math.floor(allocated*100/size))>1)storageInvalid('pool capacity does not match its sizes');
+  return {name:pool.name,state:pool.state,size,allocated,free,capacityPercent:capacity,fragmentationPercent:storagePercent(pool.fragmentationPercent,'pool fragmentation'),
     errors:totals,dataErrors:storageCount(pool.dataErrors,'pool data errors'),scan:validatedScan(pool.scan),vdevs:[root],vdevsTruncated:pool.vdevsTruncated};
 }
-function validatedDataset(dataset,seen) {
+function validatedDataset(dataset,seen,pools) {
   storageObject(dataset,'dataset');
   storageText(dataset.name,256,'dataset name');
   if(seen.has(dataset.name))storageInvalid('duplicate dataset');
+  // `zfs list -d 1`: a reported pool's root dataset or one of its direct children.
+  const parts=dataset.name.split('/');
+  if(parts.length>2 || !pools.has(parts[0]) || parts[1]==='')storageInvalid('dataset pool or depth');
   seen.add(dataset.name);
   if(dataset.mountpoint!==null)storageText(dataset.mountpoint,256,'dataset mountpoint');
   return {name:dataset.name,used:storageBytes(dataset.used,'dataset used'),available:storageBytes(dataset.available,'dataset available'),
@@ -95,14 +123,18 @@ function validatedStorageReport(data) {
   if(!['ok','error'].includes(storage.state))storageInvalid('state');
   if(storage.state==='ok'?storage.error!==null:!STORAGE_ERRORS.has(storage.error))storageInvalid('error code');
   if(storage.zfsVersion!==null && (typeof storage.zfsVersion!=='string' || !/^[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9._+~-]{0,40}$/.test(storage.zfsVersion)))storageInvalid('zfs version');
+  // A successful report always knows the OpenZFS version; only a failure may lack it.
+  if(storage.state==='ok' && storage.zfsVersion===null)storageInvalid('missing zfs version');
   if(!Array.isArray(storage.pools) || storage.pools.length>STORAGE_LIMITS.pools || storage.state==='error' && storage.pools.length)storageInvalid('pools');
   if(!STORAGE_DATASET_STATUS.has(storage.datasetsStatus))storageInvalid('dataset status');
   const listed=['complete','truncated'].includes(storage.datasetsStatus);
   if(listed!==Array.isArray(storage.datasets) || listed && storage.datasets.length>STORAGE_LIMITS.datasets)storageInvalid('datasets');
+  if(storage.state==='error' && listed)storageInvalid('datasets in an error report');
   const pools=new Set(), datasets=new Set();
+  const validPools=storage.pools.map(pool=>validatedPool(pool,pools));
   return {kind:'storage',containers:[],agentVersion:data.agentVersion,agentProtocol:data.agentProtocol,
-    storage:{state:storage.state,error:storage.error,zfsVersion:storage.zfsVersion,pools:storage.pools.map(pool=>validatedPool(pool,pools)),
-      datasetsStatus:storage.datasetsStatus,...listed?{datasets:storage.datasets.map(dataset=>validatedDataset(dataset,datasets))}:{}},
+    storage:{state:storage.state,error:storage.error,zfsVersion:storage.zfsVersion,pools:validPools,
+      datasetsStatus:storage.datasetsStatus,...listed?{datasets:storage.datasets.map(dataset=>validatedDataset(dataset,datasets,pools))}:{}},
     receivedAt:new Date().toISOString()};
 }
 function storageByteText(value) {
@@ -126,7 +158,9 @@ function scanEvent(name,previous,scan) {
 function counterText(before,after) {return ['read','write','checksum'].filter(key=>before[key]!==after[key]).map(key=>key+' '+before[key]+' → '+after[key]).join(', ');}
 // Activity for one storage report. Counters only ever increase until `zpool clear`
 // or a reboot resets them; any decrease is reported as a reset, never as an error.
-function storageEvents(previous,report) {
+// Pool comparisons use the last successful report (the baseline kept in
+// storage/<id>), so changes that happen while the agent reports errors are kept.
+function storageEvents(previous,report,baseline=null) {
   const at=report.receivedAt, lines=[], current=report.storage;
   if(!previous || previous.kind!=='storage')return [event('report','First storage agent report received',at)];
   if(Date.parse(at)-Date.parse(previous.receivedAt)>staleAfterMs(report))lines.push(['report','Reporting resumed after a gap']);
@@ -135,9 +169,9 @@ function storageEvents(previous,report) {
   if(before.zfsVersion!==current.zfsVersion && current.zfsVersion)lines.push(['host','OpenZFS changed to '+current.zfsVersion]);
   if(current.state==='error' && (before.state!=='error' || before.error!==current.error))lines.push(['storage','Storage agent error: '+current.error]);
   if(current.state==='ok' && before.state==='error')lines.push(['storage','Storage agent recovered; pool status is available again']);
-  // Pool comparisons need two successful reports; an error state has no baseline.
-  if(current.state==='ok' && before.state==='ok') {
-    const old=new Map(before.pools.map(pool=>[pool.name,pool]));
+  const baselinePools=baseline || (before.state==='ok'?before.pools:null);
+  if(current.state==='ok' && baselinePools) {
+    const old=new Map(baselinePools.map(pool=>[pool.name,pool]));
     for(const pool of current.pools) {
       const prior=old.get(pool.name);old.delete(pool.name);
       if(!prior){lines.push(['storage','Pool '+pool.name+' appeared ('+pool.state+')']);continue;}
@@ -191,6 +225,10 @@ async function recordStorageHistory(bucket,id,report) {
 }
 // zpool status only shows the latest scan, so a resilver hides the last scrub.
 // Remember each pool's last completed scrub; a pool never seen scrubbing is "unknown".
+async function storageBaseline(bucket,id) {
+  const object=await bucket.get('storage/'+id+'.json');
+  return object?(await object.json()).baseline||null:null;
+}
 async function recordStorageState(bucket,id,report) {
   if(report.storage.state!=='ok')return;
   const key='storage/'+id+'.json';
@@ -203,7 +241,8 @@ async function recordStorageState(bucket,id,report) {
       const completed=scan && scan.type==='scrub' && scan.state==='finished' && scan.endTime?{endTime:scan.endTime,errors:scan.errors,repairedBytes:scan.repairedBytes}:null;
       pools[pool.name]={lastScrub:completed && (!remembered || Date.parse(completed.endTime)>=Date.parse(remembered.endTime))?completed:remembered};
     }
-    const value=JSON.stringify({at:report.receivedAt,pools});
+    // The last successful pools are the baseline for the next report's activity.
+    const value=JSON.stringify({at:report.receivedAt,pools,baseline:report.storage.pools});
     if(object && value===JSON.stringify(saved))return;
     if(await bucket.put(key,value,{onlyIf:object?{etagMatches:object.etag}:{etagDoesNotMatch:'*'}}))return;
   }

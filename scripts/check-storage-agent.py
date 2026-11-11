@@ -269,6 +269,27 @@ class MultipathNamingChecks(unittest.TestCase):
         names = [n.name({'vdev_type': 'disk', 'name': 'x', 'devid': 'wwn-0x' + format(i, '016x')}, 'tank', used) for i in range(agent.MAX_VDEVS_PER_POOL)]
         self.assertEqual(len(set(names)), len(names))
 
+    def test_identifier_like_aliases_and_basenames_are_hashed(self):
+        with TemporaryDirectory() as directory:
+            for alias in ('ata-ST8000VN004_ZA1FAKE9', 'wwn-0x5000cca2b3c4d5e6', 'WD-WCC7K0FAKE12', '6001405abcdef0123456', 'dm-7'):
+                with self.subTest(alias=alias):
+                    root = Path(directory, 'alias-' + str(abs(hash(alias))))
+                    (root / 'dev/disk/by-id').mkdir(parents=True)
+                    (root / 'dev/dm-1').touch()
+                    (root / 'sys/block/dm-1/dm').mkdir(parents=True)
+                    (root / 'sys/block/dm-1/dm/uuid').write_text('mpath-36001405ffff0001\n')
+                    (root / 'sys/block/dm-1/dm/name').write_text(alias + '\n')
+                    (root / 'dev/disk/by-id/dm-uuid-mpath-36001405ffff0001').symlink_to('../../dm-1')
+                    node = {'vdev_type': 'disk', 'name': 'dm-uuid-mpath-36001405ffff0001', 'devid': 'dm-uuid-mpath-36001405ffff0001',
+                            'path': '/dev/disk/by-id/dm-uuid-mpath-36001405ffff0001'}
+                    name = namer(root=root).name(node, 'tank', {})
+                    self.assertRegex(name, r'^disk-[0-9a-f]{8}$')
+        for base in ('ata-image-copy', 'S6PTNM0R912345X.img', '0x5000cca2b3c4.img'):
+            with self.subTest(file=base):
+                self.assertRegex(namer().name({'vdev_type': 'file', 'name': '/srv/' + base, 'guid': 5}, 'tank', {}), r'^file-[0-9a-f]{8}$')
+        for alias in ('mpatha', 'shelf2-bay07'):
+            self.assertTrue(agent.local_name(alias), alias)
+
     def test_invalid_salts_are_refused(self):
         for salt in (None, '', 'ab' * 31, 'AB' * 32, 'zz' * 32):
             with self.subTest(salt=salt), self.assertRaises(ValueError):
@@ -356,7 +377,7 @@ class ParsingChecks(unittest.TestCase):
             self.summary(tall)
         self.assertEqual(raised.exception.code, 'invalid_output')
         datasets = {'datasets': {'tank/d' + str(i): {'properties': {'used': {'value': 1}, 'mountpoint': {'value': '-'}}} for i in range(70)}}
-        result, truncated = agent.datasets_summary(datasets)
+        result, truncated = agent.datasets_summary(datasets, {'tank'})
         self.assertEqual((len(result), truncated), (agent.MAX_DATASETS, True))
 
     def test_invalid_shapes_are_errors(self):
@@ -385,6 +406,20 @@ class ParsingChecks(unittest.TestCase):
         self.assertEqual(calls, [('zpool', ('--version',))])
         body, report = agent.encode_report(storage)
         self.assertEqual(report['storage']['error'], 'unsupported_version')
+
+    def test_dataset_lengths_use_the_dashboards_unit(self):
+        clef = '\U0001D11E'  # Outside the BMP: one code point, two UTF-16 units.
+        self.assertEqual((agent.utf16_length(clef * 3), len(clef * 3)), (6, 3))
+        listing = lambda mountpoint: {'datasets': {'tank': {'properties': {'used': {'value': 1}, 'mountpoint': {'value': mountpoint}}}}}
+        self.assertEqual(len(agent.datasets_summary(listing('/' + clef * 127), {'tank'})[0]), 1, '255 units is within the limit')
+        with self.assertRaises(agent.AgentError):
+            agent.datasets_summary(listing('/' + clef * 128), {'tank'})  # 128 code points, 257 units.
+
+    def test_datasets_are_limited_to_reported_pools_and_depth_one(self):
+        properties = {'used': {'value': 1}, 'mountpoint': {'value': '-'}}
+        listing = {'datasets': {name: {'properties': properties} for name in ('tank', 'tank/a', 'tank/a/b', 'gone', 'gone/x', 'tankish/y')}}
+        result, truncated = agent.datasets_summary(listing, {'tank'})
+        self.assertEqual(([d['name'] for d in result], truncated), (['tank', 'tank/a'], False))
 
     def test_dataset_failure_keeps_pool_status(self):
         base = FIXTURES / 'captured'
@@ -518,7 +553,9 @@ class CheckModeChecks(unittest.TestCase):
     def test_check_mode_needs_no_credentials_or_network(self):
         base = FIXTURES / 'captured'
         run = fixture_run(base / 'zpool-status.json', base / 'zpool-list.json', base / 'zfs-list.json')
-        with patch.object(agent, 'run_command', run), \
+        # Hermetic: --check builds its own namer, so point it at empty device roots.
+        hermetic = lambda salt, dev_root='/dev', sys_root='/sys', real=agent.DeviceNamer: real(salt, str(EMPTY_ROOT / 'dev'), str(EMPTY_ROOT / 'sys'))
+        with patch.object(agent, 'run_command', run), patch.object(agent, 'DeviceNamer', hermetic), \
                 patch.object(agent, 'load_config', side_effect=AssertionError('must not read credentials')), \
                 patch.object(agent, 'deliver', side_effect=AssertionError('must not send')), \
                 contextlib.redirect_stdout(io.StringIO()) as output:

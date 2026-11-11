@@ -270,7 +270,7 @@ export default {async scheduled(controller,env,ctx) {ctx.waitUntil(sweepNotifica
       await env.BUCKET.put('snapshots/'+host.id+'.json',JSON.stringify(report));
       // Optional history failures must not turn a delivered report into an ingestion failure.
       const prior=previous?await previous.json():null;
-      try {await recordHistory(env.BUCKET,host.id,[...(storageHost?storageEvents(prior,report):reportEvents(prior,report)),...(replacement?[event('credentials','Reporting token replaced',report.receivedAt)]:[])]);}catch{console.error('History write failed');}
+      try {await recordHistory(env.BUCKET,host.id,[...(storageHost?storageEvents(prior,report,await storageBaseline(env.BUCKET,host.id)):reportEvents(prior,report)),...(replacement?[event('credentials','Reporting token replaced',report.receivedAt)]:[])]);}catch{console.error('History write failed');}
       if(storageHost) {
         try {await recordStorageHistory(env.BUCKET,host.id,report);}catch{console.error('Storage history write failed');}
         try {await recordStorageState(env.BUCKET,host.id,report);}catch{console.error('Storage state write failed');}
