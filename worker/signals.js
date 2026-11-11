@@ -19,7 +19,7 @@ async function recordSignals(bucket,host,report,settings) {
     const object=await bucket.get(key), saved=object?await object.json():{};
     if(saved.at>=at)return;
     if(!object && !settings.cpuAlerts && !settings.memoryAlerts && !settings.restartBursts)return;
-    const continuous=saved.policy===policy && saved.maintenanceRevision===maintenance.revision && at-saved.at<=120000 && !saved.paused && !paused && settings.enabled;
+    const continuous=saved.policy===policy && saved.maintenanceRevision===maintenance.revision && at-saved.at<=staleAfterMs(host) && !saved.paused && !paused && settings.enabled;
     const containers={};
     for(const c of report.containers) {
       const old=continuous?saved.containers?.[c.id]:null, running=c.state==='running';
@@ -44,7 +44,7 @@ async function recordSignals(bucket,host,report,settings) {
 }
 function advancedIssues(snapshot,signals,settings) {
   const issues={},uncertain=new Set();
-  if(!snapshot || Date.now()-Date.parse(snapshot.receivedAt)>120000)return {issues,uncertain};
+  if(!snapshot || Date.now()-Date.parse(snapshot.receivedAt)>staleAfterMs(snapshot))return {issues,uncertain};
   const at=Date.parse(snapshot.receivedAt), valid=signals?.at===at && signals.policy===signalPolicy(settings);
   for(const c of snapshot.containers) {
     const track=valid?signals.containers?.[c.id]:null;

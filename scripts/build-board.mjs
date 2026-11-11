@@ -15,9 +15,13 @@ const readResources=await readFile('worker/resources.js','utf8');
 source=source.replace('// __RESOURCES_SOURCE__',()=>readResources);
 const readSignals=await readFile('worker/signals.js','utf8');
 source=source.replace('// __SIGNALS_SOURCE__',()=>readSignals);
+const readStorage=await readFile('worker/storage.js','utf8');
+source=source.replace('// __STORAGE_SOURCE__',()=>readStorage);
+const storageAgent=JSON.parse(await readFile('storage-agent/version.json','utf8'));
+source=source.replace("'__STORAGE_AGENT_VERSION__'",()=>JSON.stringify(storageAgent.version));
 const lock=JSON.parse(await readFile('package-lock.json','utf8'));
 if(lock.version!==version || lock.packages[''].version!==version)throw new Error('Package and lockfile versions must match');
-for(const [placeholder,file] of [['__UPDATE_MANAGER_SOURCE__','collector/crowsnest'],['__COLLECTOR_SOURCE__','worker/collector.py'],['__PROXY_SOURCE__','worker/proxy.cfg'],['__COMPOSE_SOURCE__','worker/compose.yaml'],['__SETUP_SOURCE__','worker/setup.sh'],['__BOARD_HTML__','worker/board.html'],['__BOARD_JS__','worker/board.js'],['__BOARD_CSS__','worker/board.css']]) {
+for(const [placeholder,file] of [['__UPDATE_MANAGER_SOURCE__','collector/crowsnest'],['__COLLECTOR_SOURCE__','worker/collector.py'],['__PROXY_SOURCE__','worker/proxy.cfg'],['__COMPOSE_SOURCE__','worker/compose.yaml'],['__SETUP_SOURCE__','worker/setup.sh'],['__BOARD_HTML__','worker/board.html'],['__BOARD_JS__','worker/board.js'],['__BOARD_CSS__','worker/board.css'],['__STORAGE_AGENT_SOURCE__','storage-agent/crowsnest_storage.py'],['__STORAGE_UNIT_SOURCE__','storage-agent/crowsnest-storage.service'],['__STORAGE_SETUP_SOURCE__','storage-agent/setup.sh']]) {
   let content=replaceVersions(await readFile(file,'utf8'));
   if(file==='collector/crowsnest')content=renderManager(content,collectorRelease);
   if(file==='worker/board.js')content=versions+'\n'+collectorDirectory+'\n'+content;

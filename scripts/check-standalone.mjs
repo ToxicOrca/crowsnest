@@ -130,6 +130,20 @@ try {
   assert.equal((await request('/api/ingest/' + setup.hostId, {method: 'POST', signed: false, data: {engineVersion: 'test', collectorVersion: '0.8.0', containers: []}, headers: {Authorization: 'Bearer ' + collector.hostToken, Origin: 'https://unrelated.example.com'}})).status, 200);
   const hosts = await (await request('/api/hosts')).json();
   assert.equal(hosts.hosts[0].snapshot.containers.length, 0);
+  // A storage host enrolls and reports through the real server; backup/restore must keep it intact.
+  const storageSetup = await (await request('/api/hosts', {method: 'POST', data: {name: 'zfs-host', kind: 'storage'}})).json();
+  const storageConfig = JSON.parse(storageSetup.setupCommand.match(/cat > storage\.json <<'CROWSNEST_FILE_EOF'\n([\s\S]*?)\nCROWSNEST_FILE_EOF/)[1]);
+  assert.equal(storageConfig.url, domain);
+  const storageReport = {agentVersion: '0.1.0', agentProtocol: 1, storage: {state: 'ok', error: null, zfsVersion: '2.4.1', datasetsStatus: 'disabled', pools: [{
+    name: 'tank', state: 'ONLINE', size: 1000, allocated: 400, free: 600, capacityPercent: 40, fragmentationPercent: 3, errors: {read: 0, write: 0, checksum: 0}, dataErrors: 0,
+    scan: {type: 'scrub', state: 'finished', startTime: '2026-11-01T00:00:00Z', endTime: '2026-11-01T01:00:00Z', examinedBytes: 400, totalBytes: 400, errors: 0, repairedBytes: 0},
+    vdevs: [{name: 'tank', type: 'root', state: 'ONLINE', read: 0, write: 0, checksum: 0, children: [{name: 'sda', type: 'disk', state: 'ONLINE', read: 0, write: 0, checksum: 0}]}], vdevsTruncated: false}]}};
+  assert.equal((await request('/api/ingest/' + storageSetup.hostId, {method: 'POST', signed: false, data: storageReport, headers: {Authorization: 'Bearer ' + storageConfig.hostToken}})).status, 200);
+  const storageRows = () => runtime.storage.db.prepare("SELECT key, value, etag FROM objects WHERE key LIKE 'storage%' ORDER BY key").all();
+  const storageBefore = storageRows();
+  assert.deepEqual(storageBefore.map(row => row.key), ['storage-history/' + storageSetup.hostId + '.json', 'storage/' + storageSetup.hostId + '.json']);
+  const storageApiBefore = await (await request('/api/storage?host=' + storageSetup.hostId)).json();
+  assert.equal(storageApiBefore.scrubs.tank.status, 'known');
   const simultaneous = await Promise.all(['TEST-HOST', 'new-host', 'NEW-HOST'].map(name => request('/api/hosts', {method: 'POST', data: {name, format: 'setup'}})));
   assert.equal(simultaneous[0].status, 409);
   assert.equal(simultaneous.filter(response => response.status === 200).length, 1);
@@ -172,6 +186,10 @@ try {
   assert.equal(login.status, 200);
   cookie = login.headers.get('set-cookie').split(';')[0];
   assert.deepEqual((await (await request('/api/hosts')).json()).hosts, before.hosts);
+  assert.ok(before.hosts.some(host => host.kind === 'storage' && host.snapshot.storage.pools[0].name === 'tank'));
+  assert.deepEqual(storageRows(), storageBefore, 'storage/ and storage-history/ rows round-trip byte for byte');
+  assert.deepEqual(await (await request('/api/storage?host=' + storageSetup.hostId)).json(), storageApiBefore);
+  assert.equal((await request('/api/ingest/' + storageSetup.hostId, {method: 'POST', signed: false, data: storageReport, headers: {Authorization: 'Bearer ' + storageConfig.hostToken}})).status, 200, 'the restored storage host keeps reporting');
   assert.equal((await request('/auth/logout', {method: 'POST'})).status, 200);
   assert.equal((await request('/api/hosts')).status, 401);
   const localAuth = new Authentication(runtime.storage, 'http://127.0.0.1:8080');
@@ -179,5 +197,5 @@ try {
   for (let i = 0; i < 11; i++) await localAuth.login({username: 'owner', password: ''}, 'fictional-rate-test').catch(() => {});
   await assert.rejects(localAuth.login({username: 'owner', password}, 'fictional-rate-test'), error => error.status === 429);
   assert.equal((await stat(config.database)).mode & 0o777, 0o600);
-  console.log('Standalone checks passed: private access, CSRF, spoofed identity, setup/recovery, persistence, concurrent enrollment, transactions, backup/restore, logout, rate limits');
+  console.log('Standalone checks passed: private access, CSRF, spoofed identity, setup/recovery, persistence, concurrent enrollment, transactions, backup/restore (including storage hosts), logout, rate limits');
 } finally { if (runtime) await runtime.close(); await rm(directory, {recursive: true, force: true}); }

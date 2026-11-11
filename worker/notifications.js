@@ -24,10 +24,13 @@ async function notificationStatus(env) {
   return {...settings,configured:!!destination,destination:destination?.url||null,authenticated:!!env.NTFY_TOKEN,...delivery,lastSweepAt:lastSweep.at||null};
 }
 function notificationIssues(host,snapshot,now,policy) {
-  if(!snapshot)return (!policy || policy.hostReports) && now-Date.parse(host.createdAt)>600000?{report:'Awaiting the first collector report'}:{};
-  if(now-Date.parse(snapshot.receivedAt)>120000) {
-    const minutes=policy?.staleMinutes||2;
-    return (!policy || policy.hostReports) && now-Date.parse(snapshot.receivedAt)>minutes*60000?{report:'No collector report for more than '+(minutes===2?'two':minutes)+' minutes'}:{};
+  if(!snapshot)return (!policy || policy.hostReports) && now-Date.parse(host.createdAt)>600000?{report:'Awaiting the first '+(host.kind==='storage'?'storage agent':'collector')+' report'}:{};
+  const staleAfter=staleAfterMs(host);
+  if(now-Date.parse(snapshot.receivedAt)>staleAfter) {
+    // The configured delay can lengthen, never shorten, the host kind's stale threshold.
+    const minutes=Math.max(policy?.staleMinutes||2,staleAfter/60000);
+    const source=host.kind==='storage'?'storage agent':'collector';
+    return (!policy || policy.hostReports) && now-Date.parse(snapshot.receivedAt)>minutes*60000?{report:'No '+source+' report for more than '+({2:'two',3:'three'}[minutes]||minutes)+' minutes'}:{};
   }
   const issues={};
   for(const c of snapshot.containers)if(issueKinds(c).some(kind=>!policy || policy[kind]))issues[c.id]=c.name+': '+c.state+'/'+c.health;
@@ -119,7 +122,7 @@ async function notifyHostUnlocked(env,host,snapshot,settings,now=Date.now()) {
   }
   for(const [id,text] of Object.entries(saved.delivered))if(!current[id])removed.push(id==='report'?(snapshot?'Collector reporting resumed':'Report warning cleared'):text.split(': ')[0]+': '+(signalKind(id)?({cpu:'CPU',memory:'Memory',burst:'Restart burst'})[id.split(':')[0]]+' alert cleared on a fresh report':'no longer in an alert state or no longer reported; check the dashboard'));
   // Suppress stale container recovery messages while their host cannot report.
-  const stale=!snapshot || now-Date.parse(snapshot.receivedAt)>120000;
+  const stale=!snapshot || now-Date.parse(snapshot.receivedAt)>staleAfterMs(host);
   if(stale)removed.length=0;
   // Retain delivered container alerts until a fresh report can resolve them.
   const baseline=stale?{...saved.delivered,...current}:current;

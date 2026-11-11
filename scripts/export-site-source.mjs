@@ -40,6 +40,8 @@ const files = [
   'worker/notifications.js',
   'worker/resources.js',
   'worker/signals.js',
+  'worker/storage.js',
+  'storage-agent/crowsnest_storage.py', 'storage-agent/crowsnest-storage.service', 'storage-agent/setup.sh', 'storage-agent/version.json',
   'worker/collector-directory.js',
   'worker/versions.js',
   'worker/collector.py', 'worker/proxy.cfg', 'worker/compose.yaml', 'worker/setup.sh',

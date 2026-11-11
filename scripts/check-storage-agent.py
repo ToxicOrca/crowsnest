@@ -548,5 +548,5 @@ if __name__ == '__main__':
     result = unittest.main(exit=False, verbosity=0).result
     if result.wasSuccessful():
         print('Passed: storage agent parsing of every captured and synthetic ZFS fixture, private allowlisted output, '
-              'per-type scan bytes, per-vdev counters, short names, limits, error states, clean commands, and delivery.')
+              'per-type scan bytes, per-vdev counters, stable private vdev names, limits, error states, clean commands, and delivery.')
     sys.exit(0 if result.wasSuccessful() else 1)

@@ -3,6 +3,10 @@ const PROXY = '__PROXY_SOURCE__';
 const COMPOSE = '__COMPOSE_SOURCE__';
 const SETUP = '__SETUP_SOURCE__';
 const UPDATE_MANAGER = '__UPDATE_MANAGER_SOURCE__';
+const STORAGE_AGENT = '__STORAGE_AGENT_SOURCE__';
+const STORAGE_UNIT = '__STORAGE_UNIT_SOURCE__';
+const STORAGE_SETUP = '__STORAGE_SETUP_SOURCE__';
+const STORAGE_AGENT_VERSION = '__STORAGE_AGENT_VERSION__';
 const HTML = '__BOARD_HTML__';
 const BOARD_JS = '__BOARD_JS__';
 const BOARD_CSS = '__BOARD_CSS__';
@@ -76,6 +80,41 @@ function installer(config) {
   const files=blocks.map(([file,body])=>"cat > "+file+" <<'CROWSNEST_FILE_EOF'\n"+body+"\nCROWSNEST_FILE_EOF\n").join('');
   return SETUP.replace('__WRITE_FILES__',()=>files);
 }
+// Storage hosts run a systemd agent instead of Compose. The salt that keys
+// vdev names is generated on the host by the installer, never here.
+function storageInstaller(config) {
+  const blocks=[['crowsnest_storage.py',STORAGE_AGENT],['crowsnest-storage.service',STORAGE_UNIT],['storage.json',JSON.stringify(config,null,2)]];
+  const files=blocks.map(([file,body])=>"cat > "+file+" <<'CROWSNEST_FILE_EOF'\n"+body+"\nCROWSNEST_FILE_EOF\n").join('');
+  return STORAGE_SETUP.replace('__WRITE_FILES__',()=>files);
+}
+function storageSetup(config) {
+  return json({hostId:config.hostId,kind:'storage',agentVersion:STORAGE_AGENT_VERSION,setupCommand:"sudo bash <<'CROWSNEST_STORAGE_SETUP'\nexport CROWSNEST_PREPARE_ONLY=1\n"+storageInstaller(config)+'\nCROWSNEST_STORAGE_SETUP\n'});
+}
+// Replaces only hostToken in place; nameSalt (and with it every vdev name) is kept.
+function storageTokenCommand(token) {
+  return ["sudo bash <<'CROWSNEST_STORAGE_TOKEN'",'set -eu','config=/etc/crowsnest-storage/storage.json',
+    'test -f "$config" || { echo "No storage agent configuration at $config" >&2; exit 1; }',
+    "/usr/bin/python3 -I - \"$config\" <<'CROWSNEST_STORAGE_PY'",
+    'import json, os, pwd, sys, tempfile',
+    'path = sys.argv[1]',
+    'with open(path) as source:',
+    '    config = json.load(source)',
+    'if "nameSalt" not in config:',
+    '    sys.exit("storage.json has no name salt; rerun setup instead")',
+    'config["hostToken"] = '+JSON.stringify(token),
+    'user = pwd.getpwnam("crowsnest-storage")',
+    'handle, staged = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".storage-")',
+    'with os.fdopen(handle, "w") as target:',
+    '    json.dump(config, target, indent=2)',
+    '    target.write("\\n")',
+    'os.chmod(staged, 0o600)',
+    'os.chown(staged, user.pw_uid, user.pw_gid)',
+    'os.replace(staged, path)',
+    'CROWSNEST_STORAGE_PY',
+    'systemctl restart crowsnest-storage',
+    "echo 'Storage agent token replaced. The dashboard confirms it on the next report.'",
+    'CROWSNEST_STORAGE_TOKEN',''].join('\n');
+}
 // __COLLECTOR_DIRECTORY_SOURCE__
 function collectorUpdate() {
   return ["bash <<'CROWSNEST_UPDATE'",'set -eu',...collectorDirectoryCommands(),
@@ -146,7 +185,7 @@ async function recordHistory(bucket,id,events) {
 function reportEvents(previous,report) {
   const at=report.receivedAt, events=[];
   if(!previous)return [event('report','First collector report received',at)];
-  if(Date.parse(at)-Date.parse(previous.receivedAt)>120000)events.push(event('report','Reporting resumed after a gap',at));
+  if(Date.parse(at)-Date.parse(previous.receivedAt)>staleAfterMs(report))events.push(event('report','Reporting resumed after a gap',at));
   const before=new Map(previous.containers.map(c=>[c.id,c]));
   for(const c of report.containers) {
     const old=before.get(c.id);before.delete(c.id);
@@ -166,6 +205,7 @@ function reportEvents(previous,report) {
 // __NOTIFICATIONS_SOURCE__
 // __RESOURCES_SOURCE__
 // __SIGNALS_SOURCE__
+// __STORAGE_SOURCE__
 export default {async scheduled(controller,env,ctx) {ctx.waitUntil(sweepNotifications(env));},async fetch(request,env,ctx) {
   const url=new URL(request.url), path=url.pathname;
   const viewer=!!request.headers.get('oai-authenticated-user-id');
@@ -218,7 +258,9 @@ export default {async scheduled(controller,env,ctx) {ctx.waitUntil(sweepNotifica
       const tokenHash=await hash(auth.slice(7));
       const replacement=safeEqual(tokenHash, host.pendingTokenHash) && Date.parse(host.pendingTokenExpiresAt)>Date.now();
       if(!safeEqual(tokenHash, host.tokenHash) && !replacement)return json({error:'Invalid reporting token'},403);
-      let report; try {report=validatedReport(await readJson(request));}catch{return json({error:'Invalid report'},400);}
+      const storageHost=host.kind==='storage';
+      if(storageHost && !storageEnabled(env))return json({error:'Storage hosts require a standalone dashboard'},409);
+      let report; try {const data=await readJson(request);report=storageHost?validatedStorageReport(data):validatedReport(data);}catch{return json({error:'Invalid report'},400);}
       const previous=await env.BUCKET.get('snapshots/'+host.id+'.json');
       if(replacement) {
         host.tokenHash=tokenHash; delete host.pendingTokenHash; delete host.pendingTokenExpiresAt;
@@ -227,9 +269,15 @@ export default {async scheduled(controller,env,ctx) {ctx.waitUntil(sweepNotifica
       }
       await env.BUCKET.put('snapshots/'+host.id+'.json',JSON.stringify(report));
       // Optional history failures must not turn a delivered report into an ingestion failure.
-      try {await recordHistory(env.BUCKET,host.id,[...reportEvents(previous?await previous.json():null,report),...(replacement?[event('credentials','Reporting token replaced',report.receivedAt)]:[])]);}catch{console.error('History write failed');}
-      try {await recordResources(env.BUCKET,host.id,report);}catch{console.error('Resource history write failed');}
-      try {await recordSignals(env.BUCKET,host,report,await notificationSettings(env));}catch{console.error('Alert observations write failed');}
+      const prior=previous?await previous.json():null;
+      try {await recordHistory(env.BUCKET,host.id,[...(storageHost?storageEvents(prior,report):reportEvents(prior,report)),...(replacement?[event('credentials','Reporting token replaced',report.receivedAt)]:[])]);}catch{console.error('History write failed');}
+      if(storageHost) {
+        try {await recordStorageHistory(env.BUCKET,host.id,report);}catch{console.error('Storage history write failed');}
+        try {await recordStorageState(env.BUCKET,host.id,report);}catch{console.error('Storage state write failed');}
+      } else {
+        try {await recordResources(env.BUCKET,host.id,report);}catch{console.error('Resource history write failed');}
+        try {await recordSignals(env.BUCKET,host,report,await notificationSettings(env));}catch{console.error('Alert observations write failed');}
+      }
       const notify=async()=>{try{await notifyHost(env,host,report,await notificationSettings(env));}catch{console.error('Notification processing failed');}};
       if(!env.DEFER_NOTIFICATIONS){if(ctx?.waitUntil)ctx.waitUntil(notify());else await notify();}
       return json({ok:true,receivedAt:report.receivedAt});
@@ -267,20 +315,23 @@ export default {async scheduled(controller,env,ctx) {ctx.waitUntil(sweepNotifica
             const report=snapshot?await snapshot.json():null;
             const active=advancedIssues(report,signals?await signals.json():null,settings).issues;
             const alertSignals=Object.entries(active).map(([key,text])=>({containerId:signalContainer(key),kind:signalKind(key),text}));
-            return {id:h.id,name:h.name,group:h.group||'',createdAt:h.createdAt,credentialRevision:h.tokenRevision||0,maintenanceUntil:maintenance.until||null,alertSignals,snapshot:report};
+            return {id:h.id,name:h.name,kind:h.kind==='storage'?'storage':'docker',staleAfterSeconds:staleAfterMs(h)/1000,group:h.group||'',createdAt:h.createdAt,credentialRevision:h.tokenRevision||0,maintenanceUntil:maintenance.until||null,alertSignals,snapshot:report};
           }));
           hosts.push(...batch.filter(Boolean));
         } cursor=list.truncated?list.cursor:undefined;
       }while(cursor);
-      return json({hosts,availableCollectorVersion:COLLECTOR_VERSION,collectorProtocol:COLLECTOR_PROTOCOL,minimumCollectorProtocol:MIN_COLLECTOR_PROTOCOL});
+      return json({hosts,availableCollectorVersion:COLLECTOR_VERSION,collectorProtocol:COLLECTOR_PROTOCOL,minimumCollectorProtocol:MIN_COLLECTOR_PROTOCOL,storageHosts:storageEnabled(env),availableStorageAgentVersion:STORAGE_AGENT_VERSION});
     }
     if(path==='/api/hosts' && request.method==='POST') {
       if(!sameOrigin(request))return json({error:'Invalid origin'},403);
       if(!env.BUCKET || !collectorReady(env))return json({error:'Collector setup unavailable'},503);
       let data; try{data=await readJson(request,2048);}catch{return json({error:'Invalid host name'},400);}
-      if(Object.keys(data).some(k=>!['name','format'].includes(k)))return json({error:'Choose a valid host name and format'},400);
+      if(Object.keys(data).some(k=>!['name','format','kind'].includes(k)))return json({error:'Choose a valid host name and format'},400);
       if(!validName(data.name))return json({error:'Use a host name up to 64 characters'},400);
-      if(data.format!==undefined && !['compose','script','setup'].includes(data.format))return json({error:'Unknown collector format'},400);
+      if(data.kind!==undefined && !['docker','storage'].includes(data.kind))return json({error:'Choose a Docker or storage host'},400);
+      const storageKind=data.kind==='storage';
+      if(storageKind && !storageEnabled(env))return json({error:'Storage hosts require a standalone dashboard'},409);
+      if(data.format!==undefined && !(storageKind?['setup']:['compose','script','setup']).includes(data.format))return json({error:'Unknown collector format'},400);
       let cursor,count=0;
       do {
         const list=await env.BUCKET.list({prefix:'hosts/',limit:101,cursor});
@@ -293,7 +344,8 @@ export default {async scheduled(controller,env,ctx) {ctx.waitUntil(sweepNotifica
         cursor=list.truncated?list.cursor:undefined;
       }while(cursor);
       const id=crypto.randomUUID(), token=crypto.randomUUID()+crypto.randomUUID();
-      await env.BUCKET.put('hosts/'+id+'.json',JSON.stringify({id,name:data.name,tokenHash:await hash(token),createdAt:new Date().toISOString()}));
+      await env.BUCKET.put('hosts/'+id+'.json',JSON.stringify({id,name:data.name,...storageKind?{kind:'storage'}:{},tokenHash:await hash(token),createdAt:new Date().toISOString()}));
+      if(storageKind)return storageSetup(collectorConfig(env,id,token));
       if(['compose','setup'].includes(data.format))return collectorDownload(collectorConfig(env,id,token),data.format);
       return new Response(installer(collectorConfig(env,id,token)),{headers:{...headers,'Content-Type':'application/octet-stream','Content-Disposition':'attachment; filename="crowsnest-setup.sh"'}});
     }
@@ -333,10 +385,23 @@ export default {async scheduled(controller,env,ctx) {ctx.waitUntil(sweepNotifica
         await env.BUCKET.delete('notifications/hosts/'+host.id+'.json');
         await env.BUCKET.delete('notifications/locks/'+host.id+'.json');
         await env.BUCKET.delete('maintenance/hosts/'+host.id+'.json');
+        await env.BUCKET.delete('storage/'+host.id+'.json');
+        await env.BUCKET.delete('storage-history/'+host.id+'.json');
         return json({ok:true});
       }
       if(hostRoute[2]==='collector' && request.method==='POST') {
         if(Object.keys(data).some(k=>k!=='format'))return json({error:'Choose a collector package or configuration'},400);
+        if(host.kind==='storage') {
+          // Storage hosts replace credentials in place; Compose packages and collector updates do not apply.
+          if(data.format!=='storage-token')return json({error:'Storage hosts support token replacement only'},400);
+          if(!storageEnabled(env))return json({error:'Storage hosts require a standalone dashboard'},409);
+          const token=crypto.randomUUID()+crypto.randomUUID();
+          host.pendingTokenHash=await hash(token);
+          host.pendingTokenExpiresAt=new Date(Date.now()+10*60000).toISOString();
+          if(!await writeHost(env.BUCKET,obj,host))return json({error:'Host changed. Refresh before preparing credentials.'},409);
+          return json({tokenCommand:storageTokenCommand(token)});
+        }
+        if(data.format==='storage-token')return json({error:'Choose a collector package or configuration'},400);
         if(data.format==='update')return json({updateCommand:collectorUpdate(),collectorVersion:COLLECTOR_VERSION});
         if(!collectorReady(env))return json({error:'Collector setup unavailable'},503);
         if(!['compose','config','setup'].includes(data.format))return json({error:'Choose a collector package or configuration'},400);
@@ -357,6 +422,18 @@ export default {async scheduled(controller,env,ctx) {ctx.waitUntil(sweepNotifica
       const object=await env.BUCKET.get('resources/'+id+'.json');
       const samples=retainedResourceSamples(object?await object.json():[],Date.now());
       return json({samples:resourceReadings(samples,container),windowSeconds:300,retentionHours:24,maxBytes:RESOURCE_MAX_BYTES});
+    }
+    if(path==='/api/storage' && request.method==='GET') {
+      if(!env.BUCKET)return json({error:'Storage unavailable'},503);
+      if(!storageEnabled(env))return json({error:'Storage hosts require a standalone dashboard'},404);
+      const id=url.searchParams.get('host');
+      if(!id || !/^[a-f0-9-]{36}$/.test(id))return json({error:'Choose a valid host'},400);
+      const [object,snapshot,state,history]=await Promise.all(['hosts/','snapshots/','storage/','storage-history/'].map(prefix=>env.BUCKET.get(prefix+id+'.json')));
+      if(!object)return json({error:'Unknown host'},404);
+      if((await object.json()).kind!=='storage')return json({error:'Not a storage host'},404);
+      const report=snapshot?await snapshot.json():null, saved=state?await state.json():{pools:{}};
+      const scrubs=Object.fromEntries((report?.storage?.pools||[]).map(pool=>[pool.name,storageScrubStatus(pool,saved.pools?.[pool.name])]));
+      return json({scrubs,history:retainedStorageHistory(history?await history.json():[],Date.now()),windowSeconds:STORAGE_HISTORY_WINDOW/1000,retentionHours:STORAGE_HISTORY_RETENTION/3600000,maxBytes:STORAGE_HISTORY_MAX_BYTES});
     }
     if(path==='/api/history' && request.method==='GET') {
       if(!env.BUCKET)return json({error:'Storage unavailable'},503);

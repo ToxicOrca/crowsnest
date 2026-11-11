@@ -37,8 +37,10 @@ function node(tag, className = '', text) {
   if (text !== undefined) el.textContent = String(text);
   return el;
 }
+// The server owns the threshold per host kind (staleAfterMs); 120 s is the Docker default.
+function staleAfterSeconds(host) {return host?.staleAfterSeconds || 120;}
 function hostState(host) {
-  return !host.snapshot ? 'Awaiting report' : age(host.snapshot.receivedAt) > 120 ? 'Stale' : 'Reporting';
+  return !host.snapshot ? 'Awaiting report' : age(host.snapshot.receivedAt) > staleAfterSeconds(host) ? 'Stale' : 'Reporting';
 }
 function groupMatches(host) {return !hostGroup || (hostGroup==='_ungrouped'?!host.group:host.group===hostGroup);}
 function scopedHosts() {return hosts.filter(h=>selected!==null?h.id===selected:groupMatches(h));}
@@ -185,7 +187,7 @@ function render() {
   $('maintenance-banner').textContent=host && paused.length?host.name+': '+maintenanceText(host)+'. Health and activity stay visible.':paused.length+' host'+(paused.length===1?' is':'s are')+' in maintenance. Automatic notifications are paused for those hosts; health and activity stay visible.';
   $('search').placeholder=fleet?'Search containers, images, or hosts':'Search containers or images';
   $('search').setAttribute('aria-label',$('search').placeholder);
-  const stale = !!snapshot && age(snapshot.receivedAt) > 120;
+  const stale = !!snapshot && age(snapshot.receivedAt) > staleAfterSeconds(host);
   $('containers').setAttribute('aria-busy', String(!loaded && loading));
   $('host-title').textContent = host ? host.name : hostGroup?(hostGroup==='_ungrouped'?'Ungrouped':hostGroup)+' hosts':'All hosts';
   $('fleet-view').querySelector('strong').textContent=hostGroup?'All hosts in group':'All hosts';
