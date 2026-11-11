@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {chmodSync,existsSync,mkdtempSync,mkdirSync,readFileSync,rmSync,statSync,writeFileSync} from 'node:fs';
+import {chmodSync,existsSync,mkdtempSync,mkdirSync,readFileSync,readdirSync,rmSync,statSync,symlinkSync,writeFileSync} from 'node:fs';
 import {spawnSync} from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
@@ -22,6 +22,7 @@ const root=mkdtempSync(path.join(os.tmpdir(),'crowsnest-storage-install-test-'))
 const bin=path.join(root,'bin'), calls=path.join(root,'calls'), script=path.join(root,'crowsnest-storage-setup.sh');
 mkdirSync(bin);
 writeFileSync(script,installer);
+const bashPath=spawnSync('bash',['-c','command -v bash'],{encoding:'utf8'}).stdout.trim();
 const shim=(name,body)=>{writeFileSync(path.join(bin,name),'#!/usr/bin/env bash\nset -eu\nprintf \'%s %s\\n\' '+name+' "$*" >> "$TEST_CALLS"\n'+body+'\n');chmodSync(path.join(bin,name),0o755);};
 shim('id',`if [[ "$*" == '-u' ]]; then if [[ "\${TEST_AS_ROOT:-}" == 1 ]]; then echo 0; else echo 1000; fi; exit 0; fi
 if [[ "$*" == '-u crowsnest-storage' && "\${TEST_USER_EXISTS:-}" == 1 ]]; then echo 999; exit 0; fi
@@ -36,9 +37,9 @@ echo '3 pool(s), datasets complete'`);
 shim('sudo','exec "$@"');
 shim('systemctl',`if [[ "$*" == 'enable --now crowsnest-storage' && "\${TEST_START_FAILURE:-}" == 1 ]]; then exit 1; fi`);
 shim('zpool','');
-const run=(target,extra={},args=[])=>{
+const run=(target,extra={},args=[],searchPath=bin+':'+process.env.PATH)=>{
   writeFileSync(calls,'');
-  const result=spawnSync('bash',[script,...args],{cwd:root,encoding:'utf8',env:{...process.env,PATH:bin+':'+process.env.PATH,TEST_CALLS:calls,CROWSNEST_STORAGE_ROOT:target,TEST_AS_ROOT:'1',...extra}});
+  const result=spawnSync(bashPath,[script,...args],{cwd:root,encoding:'utf8',env:{...process.env,PATH:searchPath,TEST_CALLS:calls,CROWSNEST_STORAGE_ROOT:target,TEST_AS_ROOT:'1',...extra}});
   return {...result,calls:readFileSync(calls,'utf8').trim().split('\n').filter(Boolean)};
 };
 const mode=file=>statSync(file).mode&0o777;
@@ -123,9 +124,12 @@ try {
   assert.ok(!result.calls.some(call=>call.startsWith('runuser')||call.startsWith('systemctl')));
   writeFileSync(script,installer);
 
-  // A host without OpenZFS is refused before anything is created.
-  rmSync(path.join(bin,'zpool'));
-  result=run(path.join(root,'no-zfs'));
-  assert.equal(result.status,1);assert.match(result.stderr,/zpool was not found/);assert.ok(!result.calls.some(call=>call.startsWith('useradd')));
+  // A host without OpenZFS is refused before anything is created. The search path holds
+  // only the shims (without zpool) and bash, so a real zpool on this machine is never found.
+  const noZfs=path.join(root,'no-zfs-bin');mkdirSync(noZfs);
+  for(const name of readdirSync(bin))if(name!=='zpool')symlinkSync(path.join(bin,name),path.join(noZfs,name));
+  symlinkSync(bashPath,path.join(noZfs,'bash'));
+  result=run(path.join(root,'no-zfs'),{},[],noZfs);
+  assert.equal(result.status,1,'a host without zpool is refused');assert.match(result.stderr,/zpool was not found/);assert.ok(!result.calls.some(call=>call.startsWith('useradd')));
   console.log('Passed: storage agent installer root requirement, refusal to overwrite, private credential ownership, host-local name salt, unprivileged access proof, prepare-only review, startup, and missing OpenZFS.');
 } finally {rmSync(root,{recursive:true,force:true});}

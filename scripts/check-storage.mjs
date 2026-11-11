@@ -107,7 +107,8 @@ try {
   // Every rejection must fail for its own rule: the validator from worker/storage.js
   // runs in a sandbox so each case can assert its exact reason, not just a 400.
   const sandbox=vm.createContext({});
-  vm.runInContext((await readFile('worker/versions.js','utf8'))+'\n'+(await readFile('worker/storage.js','utf8'))+'\nthis.validate=validatedStorageReport;this.nameAllowed=storageVdevNameAllowed;',sandbox);
+  vm.runInContext((await readFile('worker/versions.js','utf8'))+'\n'+(await readFile('worker/storage.js','utf8'))+'\nthis.validate=validatedStorageReport;this.nameAllowed=storageVdevNameAllowed;this.storageNodes=storageNodes;',sandbox);
+  const storageNodes=node=>sandbox.storageNodes(node);
   const reason=report=>{try{sandbox.validate(report);return null;}catch(error){return error.message.replace('Invalid storage report: ','');}};
   const withDatasets=fixture('captured/zpool-status');
   assert.equal(reason(clone(base)),null);assert.equal(reason(clone(withDatasets)),null);
@@ -175,6 +176,52 @@ try {
   assert.equal(reason(spaced),null,'datasets of a pool whose name has a space');
   assert.equal(reason({...clone(withDatasets),storage:{...clone(withDatasets).storage,datasets:clone(withDatasets).storage.datasets.map(d=>({...d,mountpoint:d.mountpoint&&d.mountpoint.slice(0,1)+'\u{1D11E}'.repeat(127)}))}}),null,'254 UTF-16 units is within the limit');
 
+  // Limits at their exact boundaries: the real agent's largest reports are accepted,
+  // and one more of anything is rejected for its own rule.
+  const atLimits=JSON.parse(spawnSync('python3',['-I','-c',`
+import importlib.util, json
+spec = importlib.util.spec_from_file_location('agent', 'storage-agent/crowsnest_storage.py')
+agent = importlib.util.module_from_spec(spec); spec.loader.exec_module(agent)
+namer = agent.DeviceNamer('5a' * 32, dev_root='/nonexistent', sys_root='/nonexistent')
+guid = iter(range(1, 100000))
+leaf = lambda name: {'name': '/srv/v/' + name, 'vdev_type': 'file', 'guid': next(guid), 'state': 'ONLINE', 'class': 'normal'}
+group = lambda name, children: {'name': name, 'vdev_type': 'mirror', 'guid': next(guid), 'state': 'ONLINE', 'class': 'normal', 'vdevs': {c['name']: c for c in children}}
+def pool(name, children):
+    return {'name': name, 'state': 'ONLINE', 'vdevs': {name: {'name': name, 'vdev_type': 'root', 'guid': next(guid), 'state': 'ONLINE', 'class': 'normal', 'vdevs': {c['name']: c for c in children}}}, 'error_count': 0}
+def listing(names):
+    return {'pools': {n: {'properties': {'size': {'value': 1000}, 'allocated': {'value': 400}, 'free': {'value': 600}, 'capacity': {'value': 40}, 'fragmentation': {'value': 1}}} for n in names}}
+def report(status, names, datasets=None):
+    storage = {'state': 'ok', 'error': None, 'zfsVersion': '2.4.1-1', 'pools': agent.pools_summary({'pools': status}, listing(names), namer), 'datasetsStatus': 'disabled'}
+    if datasets is not None:
+        result, truncated = agent.datasets_summary(datasets, set(names))
+        storage['datasets'], storage['datasetsStatus'] = result, 'truncated' if truncated else 'complete'
+    return json.loads(agent.encode_report(storage)[0])
+chain = leaf('bottom')
+for level in range(5):                     # root (0) > 5 nested mirrors (1-5) > leaf at depth 6
+    chain = group('mirror-' + str(level), [chain])
+wide = group('mirror-0', [leaf('d%03d' % i) for i in range(126)])   # root + mirror + 126 leaves = 128 vdevs
+properties = {'used': {'value': 1}, 'available': {'value': 1}, 'referenced': {'value': 1}, 'quota': {'value': 0}, 'mountpoint': {'value': '-'}}
+print(json.dumps({
+    'depth 6': report({'tank': pool('tank', [chain])}, ['tank']),
+    '128 vdevs': report({'tank': pool('tank', [wide])}, ['tank']),
+    '16 pools': report({'p%02d' % i: pool('p%02d' % i, [leaf('x%02d' % i)]) for i in range(16)}, ['p%02d' % i for i in range(16)]),
+    '64 datasets': report({'tank': pool('tank', [leaf('x')])}, ['tank'], {'datasets': {'tank/d%02d' % i: {'properties': properties} for i in range(70)}}),
+}))`],{encoding:'utf8'}).stdout);
+  const maxDepth=node=>1+Math.max(-1,...(node.children||[]).map(maxDepth));
+  assert.equal(maxDepth(atLimits['depth 6'].storage.pools[0].vdevs[0]),6,'the deepest vdev is at depth 6');
+  assert.equal(storageNodes(atLimits['128 vdevs'].storage.pools[0].vdevs[0]).length,128);
+  assert.equal(atLimits['128 vdevs'].storage.pools[0].vdevsTruncated,false);
+  assert.equal(atLimits['16 pools'].storage.pools.length,16);
+  assert.deepEqual([atLimits['64 datasets'].storage.datasets.length,atLimits['64 datasets'].storage.datasetsStatus],[64,'truncated']);
+  for(const [name,report] of Object.entries(atLimits))assert.equal(reason(report),null,'the agent\'s largest report at the limit ('+name+') is accepted');
+  const plusOne=[
+    ['depth 7',r=>{const leafNode=storageNodes(r.storage.pools[0].vdevs[0]).find(n=>n.name==='bottom');Object.assign(leafNode,{name:'mirror-9',type:'mirror',children:[{name:'deeper',type:'file',class:'normal',state:'ONLINE',read:0,write:0,checksum:0}]});},'vdev tree too deep','depth 6'],
+    ['129 vdevs',r=>{r.storage.pools[0].vdevs[0].children[0].children.push({name:'d126',type:'file',class:'normal',state:'ONLINE',read:0,write:0,checksum:0});},'too many vdevs','128 vdevs'],
+    ['17 pools',r=>{r.storage.pools.push({...clone(r.storage.pools[0]),name:'p16',vdevs:[{...clone(r.storage.pools[0].vdevs[0]),name:'p16'}]});},'pools','16 pools'],
+    ['65 datasets',r=>{r.storage.datasets.push({...r.storage.datasets[0],name:'tank/d64'});},'datasets','64 datasets'],
+  ];
+  for(const [name,change,expected,from] of plusOne){const report=clone(atLimits[from]);change(report);assert.equal(reason(report),expected,name+' (one past the limit) must fail for its own rule');}
+
   // Names: the server independently allows only shapes the agent emits, per vdev type.
   const accepted=[['disk','sda'],['disk','sdab'],['disk','nvme0n1'],['disk','vdb'],['disk','xvdf'],['disk','mmcblk0'],['disk','md127'],['disk','zd16'],
     ['disk','mpatha'],['disk','mpathbz'],['disk','disk-3f9a2c11'],['dspare','dspare-0a1b2c3d'],['unknown','device-0a1b2c3d'],['unknown','sdc'],
@@ -228,6 +275,14 @@ print(json.dumps(out))`,JSON.stringify([...accepted,...rejected])],{encoding:'ut
   assert.equal((await ingest({...dockerReport,storage:base.storage},dockerToken,docker.hostId)).status,200);
   assert.equal(read('snapshots/'+docker.hostId+'.json').storage,undefined);
   assert.equal((await ingest(base,dockerToken,docker.hostId)).status,400,'storage report to a Docker host');
+  // As on main: an unreadable previous snapshot skips only the history write; the report is accepted.
+  for(const [hostId,token,report] of [[docker.hostId,dockerToken,dockerReport],[id,config.hostToken,base]]) {
+    const historyBefore=objects.get('history/'+hostId+'.json');
+    objects.set('snapshots/'+hostId+'.json','{not json');
+    assert.equal((await ingest(report,token,hostId)).status,200,'an unreadable previous snapshot does not fail ingest');
+    assert.doesNotThrow(()=>JSON.parse(objects.get('snapshots/'+hostId+'.json')),'the new snapshot replaces it');
+    assert.equal(objects.get('history/'+hostId+'.json'),historyBefore,'only the history write is skipped');
+  }
 
   // Activity: state changes, new errors, resets and scan completion.
   const reset=()=>{for(const prefix of ['snapshots/','history/','storage/','storage-history/'])objects.delete(prefix+id+'.json');};
@@ -414,6 +469,13 @@ print(json.dumps(out))`,JSON.stringify([...accepted,...rejected])],{encoding:'ut
     assert.equal((await stat(file)).mode&0o777,0o600);
     await writeFile(file,JSON.stringify(config));
     assert.notEqual(spawnSync('python3',['-I','-',file],{input:python,encoding:'utf8'}).status,0,'refuses a config without a salt');
+    // Pasted on another storage host, the command changes nothing there.
+    const otherHost=JSON.stringify({...config,hostId:'99999999-9999-4999-8999-999999999999',hostToken:'test-host-token',nameSalt:'5a'.repeat(32)});
+    await writeFile(file,otherHost);
+    const wrongHost=spawnSync('python3',['-I','-',file],{input:python,encoding:'utf8'});
+    assert.notEqual(wrongHost.status,0,'refuses a storage.json for a different host');
+    assert.match(wrongHost.stderr,/belongs to a different storage host; nothing was changed/);
+    assert.equal(await readFile(file,'utf8'),otherHost,'the other host keeps its token');
   } finally {await rm(directory,{recursive:true,force:true});}
   assert.equal(spawnSync('bash',['-n'],{input:replacement.tokenCommand.split('\n').slice(1,-2).join('\n')}).status,0);
   assert.equal((await ingest(corrupted,newToken)).status,200,'the staged token activates on its first report');

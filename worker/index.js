@@ -91,7 +91,7 @@ function storageSetup(config) {
   return json({hostId:config.hostId,kind:'storage',agentVersion:STORAGE_AGENT_VERSION,setupCommand:"sudo bash <<'CROWSNEST_STORAGE_SETUP'\nexport CROWSNEST_PREPARE_ONLY=1\n"+storageInstaller(config)+'\nCROWSNEST_STORAGE_SETUP\n'});
 }
 // Replaces only hostToken in place; nameSalt (and with it every vdev name) is kept.
-function storageTokenCommand(token) {
+function storageTokenCommand(token,hostId) {
   return ["sudo bash <<'CROWSNEST_STORAGE_TOKEN'",'set -eu','config=/etc/crowsnest-storage/storage.json',
     'test -f "$config" || { echo "No storage agent configuration at $config" >&2; exit 1; }',
     "/usr/bin/python3 -I - \"$config\" <<'CROWSNEST_STORAGE_PY'",
@@ -99,6 +99,8 @@ function storageTokenCommand(token) {
     'path = sys.argv[1]',
     'with open(path) as source:',
     '    config = json.load(source)',
+    'if config.get("hostId") != '+JSON.stringify(hostId)+':',
+    '    sys.exit("storage.json belongs to a different storage host; nothing was changed")',
     'if "nameSalt" not in config:',
     '    sys.exit("storage.json has no name salt; rerun setup instead")',
     'config["hostToken"] = '+JSON.stringify(token),
@@ -269,8 +271,10 @@ export default {async scheduled(controller,env,ctx) {ctx.waitUntil(sweepNotifica
       }
       await env.BUCKET.put('snapshots/'+host.id+'.json',JSON.stringify(report));
       // Optional history failures must not turn a delivered report into an ingestion failure.
-      const prior=previous?await previous.json():null;
-      try {await recordHistory(env.BUCKET,host.id,[...(storageHost?storageEvents(prior,report,await storageBaseline(env.BUCKET,host.id)):reportEvents(prior,report)),...(replacement?[event('credentials','Reporting token replaced',report.receivedAt)]:[])]);}catch{console.error('History write failed');}
+      // As before storage hosts existed: an unreadable previous snapshot only skips the history write.
+      let prior=null, priorReadable=true;
+      try {prior=previous?await previous.json():null;}catch{priorReadable=false;}
+      try {if(!priorReadable)throw new Error('Previous snapshot unreadable');await recordHistory(env.BUCKET,host.id,[...(storageHost?storageEvents(prior,report,await storageBaseline(env.BUCKET,host.id)):reportEvents(prior,report)),...(replacement?[event('credentials','Reporting token replaced',report.receivedAt)]:[])]);}catch{console.error('History write failed');}
       if(storageHost) {
         try {await recordStorageHistory(env.BUCKET,host.id,report);}catch{console.error('Storage history write failed');}
         try {await recordStorageState(env.BUCKET,host.id,report);}catch{console.error('Storage state write failed');}
@@ -399,7 +403,7 @@ export default {async scheduled(controller,env,ctx) {ctx.waitUntil(sweepNotifica
           host.pendingTokenHash=await hash(token);
           host.pendingTokenExpiresAt=new Date(Date.now()+10*60000).toISOString();
           if(!await writeHost(env.BUCKET,obj,host))return json({error:'Host changed. Refresh before preparing credentials.'},409);
-          return json({tokenCommand:storageTokenCommand(token)});
+          return json({tokenCommand:storageTokenCommand(token,host.id)});
         }
         if(data.format==='storage-token')return json({error:'Choose a collector package or configuration'},400);
         if(data.format==='update')return json({updateCommand:collectorUpdate(),collectorVersion:COLLECTOR_VERSION});
