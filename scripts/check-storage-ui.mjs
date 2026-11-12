@@ -70,7 +70,7 @@ assert.equal((await call('/api/hosts/'+dockerId+'/collector','POST',{format:'sto
 
 // Board: the settings form uses the server's limits and every storage rule.
 const html=await readFile('worker/board.html','utf8'), board=await readFile('worker/board.js','utf8');
-const rules=vm.createContext({});vm.runInContext(await readFile('worker/storage.js','utf8')+'\nthis.api={STORAGE_ALERT_DEFAULTS,STORAGE_ALERT_NUMBERS};',rules);
+const rules=vm.createContext({});vm.runInContext(await readFile('worker/storage.js','utf8')+'\nthis.api={STORAGE_ALERT_DEFAULTS,STORAGE_ALERT_NUMBERS,storageTimeText,storageAttention};',rules);
 for(const [key,value] of Object.entries(rules.api.STORAGE_ALERT_DEFAULTS)) {
   const input=html.match(new RegExp('<input id="notifications-'+key+'"[^>]*>'))?.[0];
   assert.ok(input,'settings input for '+key);
@@ -88,7 +88,7 @@ const helpers=vm.createContext({Date,Math,Number,String,Object});
 vm.runInContext([await readFile('worker/versions.js','utf8'),'let lastError="", availableStorageAgentVersion="0.2.0";',
   slice('const age = iso','function node('),slice('function staleAfterSeconds','function groupMatches('),slice('function storageAgentInfo(','function collectorInfo('),
   slice('function reportDate(','function renderResourceOverview('),slice('// ZFS storage hosts. Issues come','function vdevItem('),
-  'this.api={storageEngineText,stateClass,scanProgress,lastScrubText,storageAgentInfo,poolAlerts,storageAlerts};'].join('\n'),helpers);
+  'this.api={storageEngineText,stateClass,scanProgress,lastScrubText,storageAgentInfo,poolAlerts,storageAlerts,deviceErrorText,poolStateClass,poolRank,alertText};'].join('\n'),helpers);
 const ui=helpers.api;
 assert.equal(ui.storageEngineText({storage:{state:'ok',zfsVersion:'2.4.1-1'}}),'OpenZFS 2.4.1-1');
 assert.equal(ui.storageEngineText({storage:{state:'error',zfsVersion:null}}),'ZFS status unavailable');
@@ -116,4 +116,41 @@ assert.equal(ui.storageAgentInfo({kind:'storage',snapshot:null}).text,'Storage a
 const listedHost={kind:'storage',storageAlerts:[{pool:'tank',text:'a'},{pool:'bulk',text:'b'},{pool:null,text:'c'}]};
 assert.deepEqual(clone(ui.poolAlerts(listedHost,'tank').map(a=>a.text)),['a']);
 assert.deepEqual(clone(ui.storageAlerts({kind:'docker',storageAlerts:[{pool:'x'}]})),[],'only storage hosts have storage issues');
-console.log('Storage UI checks passed: storage issues on the host list (all rules shown, thresholds applied, agent errors, none on Docker hosts), resumed storage setup and its token, settings limits matching the server, and board storage helpers.');
+// Device errors: the pool's own counters stay 0 while a member disk has errors (the preview's coldpool and tank).
+const fixturePool=name=>clone(agentReports[name].storage.pools[0]);
+const coldpool=fixturePool('synthetic/checksum-errors'), faulted=fixturePool('synthetic/faulted-vdev'), healthy=fixturePool('synthetic/scrub-in-progress');
+assert.deepEqual(clone(coldpool.errors),{read:0,write:0,checksum:0},'the fixture keeps root counters at 0');
+assert.equal(ui.deviceErrorText(coldpool),'17 checksum (sdd)');
+assert.equal(ui.deviceErrorText(faulted),'3 read, 41 write (sde)');
+assert.equal(ui.deviceErrorText(healthy),'None');
+const many=fixturePool('synthetic/checksum-errors');for(const disk of many.vdevs[0].children[0].children)disk.read=1;many.vdevs[0].children[0].read=2;
+many.vdevs[0].children.push({...clone(many.vdevs[0].children[0]),name:'mirror-1',children:[{...clone(many.vdevs[0].children[0].children[0]),name:'sdf'}]});
+assert.equal(ui.deviceErrorText(many),'2 read (mirror-0); 1 read, 17 checksum (sdd); 1 read (sde); +2 more','groups and members, capped at three');
+// ONLINE keeps its text, but any open issue (or device errors alone) colors it as a warning.
+assert.equal(ui.poolStateClass(coldpool,[]),'warn','device errors alone');
+assert.equal(ui.poolStateClass(healthy,[{rule:'scrub-age'}]),'warn','any open issue');
+assert.equal(ui.poolStateClass(healthy,[]),'good');
+assert.equal(ui.poolStateClass(faulted,[]),'warn','DEGRADED keeps its own class');
+assert.equal(ui.poolStateClass({...healthy,state:'FAULTED'},[]),'bad');
+// Severity order: not ONLINE, data errors, device errors, capacity, scrub issues, healthy.
+const ranked=[[healthy,[],'healthy'],[healthy,[{rule:'scrub-age'}],'scrub'],[healthy,[{rule:'capacity'}],'capacity'],[coldpool,[],'devices'],
+  [healthy,[{rule:'data-errors'}],'data'],[faulted,[],'degraded'],[null,[{rule:'agent'}],'agent']];
+assert.deepEqual([...ranked].sort((a,b)=>ui.poolRank(a[0],a[1])-ui.poolRank(b[0],b[1])).map(r=>r[2]),['degraded','agent','data','devices','capacity','scrub','healthy']);
+assert.ok(ui.poolRank(healthy,[{rule:'capacity'},{rule:'data-errors'},{rule:'scrub-age'}])<ui.poolRank(coldpool,[]),'the worst issue decides');
+assert.deepEqual(clone(ui.poolAlerts({kind:'storage',storageAlerts:[{pool:'p',rule:'scrub-age'},{pool:'p',rule:'capacity'},{pool:'p',rule:'errors'},{pool:'p',rule:'data-errors'}]},'p').map(a=>a.rule)),['data-errors','errors','capacity','scrub-age'],'issues list most severe first');
+// Times: readable UTC in alert text (ntfy), the viewer's own format on the dashboard; never raw ISO.
+assert.equal(rules.api.storageTimeText('2026-11-09T06:27:00Z'),'9 Nov 2026, 06:27 UTC');
+const scrubbed=fixturePool('synthetic/checksum-errors');scrubbed.name='coldpool';scrubbed.vdevs[0].name='coldpool';
+const end=new Date(Date.now()-3*86400000).toISOString().replace(/\.\d{3}Z$/,'Z');Object.assign(scrubbed.scan,{endTime:end,startTime:end});
+const shown=clone(rules.api.storageAttention({receivedAt:end,storage:{state:'ok',pools:[scrubbed]}},{pools:{coldpool:{lastScrub:{endTime:end,errors:2,repairedBytes:1048576}}}},rules.api.STORAGE_ALERT_DEFAULTS,Date.now()));
+const scrubIssue=shown.find(a=>a.rule==='scrub-errors');
+assert.deepEqual(scrubIssue.time,{at:end,text:rules.api.storageTimeText(end)});
+assert.ok(!/\d{4}-\d\d-\d\dT/.test(scrubIssue.text),'no ISO time in alert text: '+scrubIssue.text);
+assert.equal(ui.alertText(scrubIssue),scrubIssue.text.replace(scrubIssue.time.text,new Date(end).toLocaleString()));
+assert.notEqual(ui.alertText(scrubIssue),scrubIssue.text);
+assert.equal(ui.alertText({text:'tank: pool is DEGRADED'}),'tank: pool is DEGRADED');
+const never=fixturePool('captured-scenarios/01-fresh-never-scrubbed');
+assert.deepEqual(clone(rules.api.storageAttention({storage:{state:'ok',pools:[never]}},{pools:{[never.name]:{firstSeen:new Date(Date.now()-40*86400000).toISOString()}}},rules.api.STORAGE_ALERT_DEFAULTS,Date.now()).filter(a=>a.rule==='scrub-age').map(a=>a.text)),[never.name+': never scrubbed']);
+// The heading says "Fleet" only with storage hosts; Docker-only dashboards keep upstream's text.
+assert.ok(html.includes('<title>Crowsnest · Docker fleet monitor</title>') && html.includes('<h1 id="fleet-heading">Docker fleet</h1>'));
+console.log('Storage UI checks passed: storage issues on the host list (all rules shown, thresholds applied, agent errors, none on Docker hosts), resumed storage setup and its token, settings limits matching the server, and board storage helpers (device errors, pool state color, severity order, issue times).');

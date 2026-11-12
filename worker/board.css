@@ -363,7 +363,7 @@ dialog:not([data-kind="storage"]) .storage-only, [data-kind="storage"] .docker-o
 .pool-facts div { display: grid; grid-template-columns: minmax(8.5em, 38%) 1fr; gap: 12px; font-size: 13px; }
 .pool-facts dt { color: var(--muted); }
 .pool-facts dd { margin: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
-.pool-facts .has-errors dd { color: var(--orange); }
+.pool-facts .has-errors dd { color: var(--orange); font-weight: 600; }
 .pool-alerts { margin: 14px 0 0; padding: 10px 12px 10px 28px; background: #352c1f; border: 1px solid #756043; border-radius: 6px; font-size: 13px; color: #f5d6a7; }
 .pool-alerts li + li { margin-top: 4px; }
 .pool-alerts li.bad { color: #f9c9cc; }

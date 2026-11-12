@@ -320,15 +320,22 @@ function storageVdevLabel(pool,node) {
   const role={special:'special',dedup:'dedup',log:'log',l2cache:'cache',spare:'spare'}[node.class];
   return pool.name+'/'+node.name+(role?' ('+role+')':'');
 }
+// Alert text names times in a fixed, readable UTC form (ntfy has no viewer locale); the dashboard
+// receives the time itself and shows it in the viewer's local format.
+const STORAGE_MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+function storageTimeText(iso) {
+  const d=new Date(iso), pad=n=>String(n).padStart(2,'0');
+  return d.getUTCDate()+' '+STORAGE_MONTHS[d.getUTCMonth()]+' '+d.getUTCFullYear()+', '+pad(d.getUTCHours())+':'+pad(d.getUTCMinutes())+' UTC';
+}
 // Current storage issues for a fresh report. `delivered` is the last delivered baseline;
 // `state` is storage/<id> (remembered scrubs and when each pool was first seen).
 function storageIssues(snapshot,state,settings,delivered,now) {
-  const issues={}, uncertain=new Set(), high=new Set(), low=new Set(), counters={}, storage=snapshot.storage;
+  const issues={}, uncertain=new Set(), high=new Set(), low=new Set(), counters={}, times={}, storage=snapshot.storage;
   if(storage.state==='error') {
     if(settings.hostReports)issues['zfs:agent:']='Storage agent cannot read ZFS ('+storage.error+')';
     // Pool status is unknown, not recovered: keep every delivered pool alert.
     for(const id of Object.keys(delivered))if(storageAlertRule(id) && storageAlertRule(id)!=='agent')uncertain.add(id);
-    return {issues,uncertain,high,low,counters};
+    return {issues,uncertain,high,low,counters,times};
   }
   for(const pool of storage.pools) {
     const name=pool.name;
@@ -351,16 +358,16 @@ function storageIssues(snapshot,state,settings,delivered,now) {
     if(pool.vdevsTruncated)for(const id of Object.keys(delivered))if(['vdev','errors'].includes(storageAlertRule(id)) && id.split(':').slice(2).join(':').startsWith(name+'/') && !present.has(id.split(':').slice(2).join(':')))uncertain.add(id);
     const remembered=state?.pools?.[name], scrub=storageScrubStatus(pool,remembered);
     if(settings.storageScrubErrorAlerts && scrub.status==='known' && (scrub.errors>0 || scrub.repairedBytes>0))
-      issues['zfs:scrub-errors:'+name]=name+': scrub finished '+scrub.endTime+' repaired '+storageByteText(scrub.repairedBytes||0)+' with '+scrub.errors+' error(s)';
+      {issues['zfs:scrub-errors:'+name]=name+': scrub finished '+storageTimeText(scrub.endTime)+' repaired '+storageByteText(scrub.repairedBytes||0)+' with '+scrub.errors+' error(s)';times['zfs:scrub-errors:'+name]=scrub.endTime;}
     const scrubbing=pool.scan?.type==='scrub' && pool.scan.state==='scanning', limit=settings.storageScrubDays*86400000;
     if(settings.storageScrubAgeAlerts) {
       const id='zfs:scrub-age:'+name;
       // A running scrub is the remedy: no new alert starts, and a delivered one clears only when it finishes.
       if(scrubbing){if(delivered[id])uncertain.add(id);}
-      else if(scrub.status==='known'){if(now-Date.parse(scrub.endTime)>limit){issues[id]=name+': last completed scrub ('+scrub.endTime+') is older than '+settings.storageScrubDays+' days';low.add(id);}}
+      else if(scrub.status==='known'){if(now-Date.parse(scrub.endTime)>limit){issues[id]=name+': last completed scrub ('+storageTimeText(scrub.endTime)+') is older than '+settings.storageScrubDays+' days';times[id]=scrub.endTime;low.add(id);}}
       // "never" (ZFS has no scan record) and "unknown" (the server never saw one finish)
       // alert only once the server itself has watched the pool for the whole period.
-      else if(remembered?.firstSeen && now-Date.parse(remembered.firstSeen)>limit){issues[id]=name+': '+(scrub.status==='never'?'never scrubbed':'no completed scrub seen')+' in '+settings.storageScrubDays+' days';low.add(id);}
+      else if(remembered?.firstSeen && now-Date.parse(remembered.firstSeen)>limit){issues[id]=name+': '+(scrub.status==='never'?'never scrubbed':'no completed scrub seen in '+settings.storageScrubDays+' days');low.add(id);}
     }
     if(settings.storageCapacityAlerts) {
       const id='zfs:capacity:'+name, was=delivered[id], cap=pool.capacityPercent;
@@ -372,7 +379,7 @@ function storageIssues(snapshot,state,settings,delivered,now) {
       }
     }
   }
-  return {issues,uncertain,high,low,counters};
+  return {issues,uncertain,high,low,counters,times};
 }
 // Dashboard view of the same rules: every rule on (settings choose what ntfy sends, not what
 // the dashboard shows), the operator's thresholds, and no delivered baseline (no hysteresis).
@@ -382,7 +389,7 @@ function storageAttention(snapshot,state,settings,now) {
   for(const [key,value] of Object.entries(STORAGE_ALERT_DEFAULTS))if(typeof value==='boolean')rules[key]=true;
   const result=storageIssues(snapshot,state,rules,{},now);
   return Object.entries(result.issues).map(([id,text])=>({id,rule:storageAlertRule(id),pool:id.split(':').slice(2).join(':').split('/')[0]||null,
-    severity:result.high.has(id)?'high':result.low.has(id)?'low':'default',text}));
+    severity:result.high.has(id)?'high':result.low.has(id)?'low':'default',text,...result.times[id]?{time:{at:result.times[id],text:storageTimeText(result.times[id])}}:{}}));
 }
 function storageRecoveryText(id,snapshot) {
   const rule=storageAlertRule(id), target=id.split(':').slice(2).join(':'), [name,vdev]=target.split('/');

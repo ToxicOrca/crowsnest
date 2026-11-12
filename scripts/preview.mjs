@@ -60,12 +60,12 @@ function fixtures() {
   const pool=(fixture,name,scrubbedAgo)=>{const p=structuredClone(agentReports[fixture].storage.pools[0]);p.name=name;p.vdevs[0].name=name;
     if(scrubbedAgo && p.scan?.state==='finished')Object.assign(p.scan,{startTime:ago(scrubbedAgo+5400),endTime:ago(scrubbedAgo)});return p;};
   const harbor={kind:'storage',containers:[],agentVersion:storageAgentVersion,agentProtocol:1,receivedAt:ago(18),storage:{state:'ok',error:null,zfsVersion:'2.4.1-1',
-    pools:[pool('synthetic/faulted-vdev','tank',50*86400),pool('synthetic/capacity-92','bulk',6*86400),pool('synthetic/scrub-in-progress','fastpool'),pool('synthetic/never-scrubbed','backup')],
+    pools:[pool('synthetic/faulted-vdev','tank',50*86400),pool('synthetic/capacity-92','bulk',6*86400),pool('synthetic/scrub-in-progress','fastpool'),pool('synthetic/never-scrubbed','backup'),pool('synthetic/checksum-errors','coldpool',3*86400),(()=>{const v=pool('synthetic/checksum-errors','vault',2*86400);v.dataErrors=0;Object.assign(v.scan,{errors:0,repairedBytes:0});v.capacityPercent=31;v.allocated=Math.round(v.size*0.31);v.free=v.size-v.allocated;const clean=n=>{n.checksum=0;(n.children||[]).forEach(clean);};v.vdevs.forEach(clean);return v;})()],
     datasetsStatus:'complete',datasets:[{name:'tank',used:257949696,available:195915264,referenced:98304,quota:null,mountpoint:'/tank'},{name:'tank/archive',used:201326592,available:195915264,referenced:201326592,quota:null,mountpoint:'/tank/archive'},{name:'tank/home',used:56623104,available:46137344,referenced:56623104,quota:104857600,mountpoint:'/tank/home'},{name:'bulk',used:462422016,available:40894464,referenced:462422016,quota:null,mountpoint:'/bulk'}]}};
   const quarry={kind:'storage',containers:[],agentVersion:storageAgentVersion,agentProtocol:1,receivedAt:ago(25),storage:{state:'error',error:'permission_denied',zfsVersion:null,pools:[],datasetsStatus:'disabled'}};
   const settings={...STORAGE_ALERT_DEFAULTS,hostReports:true};
   data.hosts.push(
-    {id:'demo-harbor',name:'harbor',kind:'storage',staleAfterSeconds:180,group:'Home',snapshot:harbor,storageAlerts:storageAttention(harbor,{pools:{tank:{lastScrub:{endTime:ago(50*86400),errors:0,repairedBytes:0}},bulk:{lastScrub:{endTime:ago(6*86400),errors:0,repairedBytes:0}},fastpool:{lastScrub:{endTime:ago(20*86400),errors:0,repairedBytes:0}},backup:{firstSeen:ago(40*86400)}}},settings,Date.now())},
+    {id:'demo-harbor',name:'harbor',kind:'storage',staleAfterSeconds:180,group:'Home',snapshot:harbor,storageAlerts:storageAttention(harbor,{pools:{tank:{lastScrub:{endTime:ago(50*86400),errors:0,repairedBytes:0}},bulk:{lastScrub:{endTime:ago(6*86400),errors:0,repairedBytes:0}},fastpool:{lastScrub:{endTime:ago(20*86400),errors:0,repairedBytes:0}},coldpool:{lastScrub:{endTime:ago(3*86400),errors:2,repairedBytes:1048576}},vault:{lastScrub:{endTime:ago(2*86400),errors:0,repairedBytes:0}},backup:{firstSeen:ago(40*86400)}}},settings,Date.now())},
     {id:'demo-quarry',name:'quarry',kind:'storage',staleAfterSeconds:180,group:'Home',snapshot:quarry,storageAlerts:storageAttention(quarry,null,settings,Date.now())},
   );
   data.storageHosts=true;data.availableStorageAgentVersion=storageAgentVersion;
@@ -90,7 +90,7 @@ const server = createServer(async (req, res) => {
   }
   if(url.pathname==='/api/storage' && req.method==='GET') {
     const host=fixtures().hosts.find(h=>h.id===url.searchParams.get('host'));
-    const remembered={tank:{lastScrub:{endTime:ago(50*86400),errors:0,repairedBytes:0}},bulk:{lastScrub:{endTime:ago(6*86400),errors:0,repairedBytes:0}},fastpool:{lastScrub:{endTime:ago(20*86400),errors:0,repairedBytes:0}}};
+    const remembered={tank:{lastScrub:{endTime:ago(50*86400),errors:0,repairedBytes:0}},bulk:{lastScrub:{endTime:ago(6*86400),errors:0,repairedBytes:0}},fastpool:{lastScrub:{endTime:ago(20*86400),errors:0,repairedBytes:0}},coldpool:{lastScrub:{endTime:ago(3*86400),errors:2,repairedBytes:1048576}},vault:{lastScrub:{endTime:ago(2*86400),errors:0,repairedBytes:0}}};
     res.setHeader('Content-Type','application/json');res.end(JSON.stringify({scrubs:Object.fromEntries((host?.snapshot?.storage?.pools||[]).map(p=>[p.name,storageScrubStatus(p,remembered[p.name])])),history:[]}));return;
   }
   if(url.pathname==='/api/resources' && req.method==='GET'){res.setHeader('Content-Type','application/json');res.end(JSON.stringify({samples:resourceFixtures(url.searchParams.get('host'),url.searchParams.get('container')),windowSeconds:300,retentionHours:24}));return;}

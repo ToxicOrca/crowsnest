@@ -28,7 +28,8 @@ const needsAttention = c => c.health === 'unhealthy' || ['restarting', 'dead'].i
 const isStorage = h => h?.kind === 'storage';
 const storagePools = h => h?.snapshot?.storage?.pools || [];
 const storageAlerts = h => isStorage(h) ? h.storageAlerts || [] : [];
-const poolAlerts = (h, name) => storageAlerts(h).filter(a => a.pool === name);
+// Most severe first, in the order pools are sorted (POOL_RANKS).
+const poolAlerts = (h, name) => storageAlerts(h).filter(a => a.pool === name).sort((a, b) => (POOL_RANKS[a.rule] ?? 4) - (POOL_RANKS[b.rule] ?? 4));
 const inMaintenance = h => Date.parse(h?.maintenanceUntil) > Date.now();
 const maintenanceText = h => 'Notifications paused until '+new Date(h.maintenanceUntil).toLocaleString();
 function duration(seconds) {
@@ -193,6 +194,10 @@ function render() {
   const reporting = hosts.filter(h => hostState(h) === 'Reporting').length;
   const staleHosts = hosts.filter(h => hostState(h) === 'Stale').length;
   $('host-count').textContent = loaded ? (hostGroup?hosts.filter(groupMatches).length+' / ':'')+hosts.length : '—';
+  // Docker-only dashboards keep upstream's wording.
+  const mixedFleet = hosts.some(isStorage);
+  $('fleet-heading').textContent = mixedFleet ? 'Fleet' : 'Docker fleet';
+  document.title = mixedFleet ? 'Crowsnest · Fleet monitor' : 'Crowsnest · Docker fleet monitor';
   $('fleet-summary').textContent = !loaded ? 'Loading your fleet…' : !hosts.length ? 'Connect a host to start watching your containers.' :
     hosts.length + (hosts.length === 1 ? ' host' : ' hosts') + ' · ' + reporting + ' reporting' + (staleHosts ? ' · ' + staleHosts + ' stale' : '');
   const host = hosts.find(h => h.id === selected), snapshot = host?.snapshot, fleet = selected === null;
@@ -240,7 +245,7 @@ function render() {
     .sort((a, b) => Number(needsAttention(b)) - Number(needsAttention(a)) || a.name.localeCompare(b.name));
   const poolAttention = pools.filter(r => r.alerts.length).length;
   const visiblePools = pools.filter(r => (!storageOnly || r.alerts.length) && (!query || [r.pool?.name, r.host.name].join(' ').toLowerCase().includes(query)))
-    .sort((a, b) => Number(!!b.alerts.length) - Number(!!a.alerts.length) || a.host.name.localeCompare(b.host.name) || (a.pool?.name || '').localeCompare(b.pool?.name || ''));
+    .sort((a, b) => poolRank(a.pool, a.alerts) - poolRank(b.pool, b.alerts) || a.host.name.localeCompare(b.host.name) || (a.pool?.name || '').localeCompare(b.pool?.name || ''));
   $('table-tools').hidden = inspecting || view !== 'containers' || (!containers.length && !pools.length);
   $('attention-filter').hidden = $('compose-group').hidden = !containers.length;
   $('storage-filter').hidden = !pools.length;
@@ -524,7 +529,7 @@ function alerts() {
     const state=hostState(h);
     if(state==='Stale') result.push({host:h,text:'No report for '+duration(age(h.snapshot.receivedAt))+'. '+(isStorage(h)?'Pool':'Container')+' states are last known.'});
     if(!h.snapshot && age(h.createdAt)>600) result.push({host:h,text:'Enrollment has not received a first report. Continue setup or check '+(isStorage(h)?'storage agent':'collector')+' logs.'});
-    for(const alert of storageAlerts(h))result.push({host:h,text:alert.text+(state==='Stale'?' (last known)':'')});
+    for(const alert of storageAlerts(h))result.push({host:h,text:alertText(alert)+(state==='Stale'?' (last known)':'')});
     for(const c of h.snapshot?.containers||[]) if(needsAttention(c)) result.push({host:h,containerId:c.id,text:c.name+' · '+c.state+' · '+c.health+(state==='Stale'?' (last known)':'')});
     if(state!=='Stale' && !lastError)for(const signal of h.alertSignals||[])result.push({host:h,containerId:signal.containerId,text:signal.text});
   }
@@ -780,6 +785,34 @@ function storageEngineText(snapshot) {
   return storage?.state==='error'?'ZFS status unavailable':storage?.zfsVersion?'OpenZFS '+storage.zfsVersion:'OpenZFS version unknown';
 }
 function stateClass(state) {return state==='ONLINE'?'good':state==='DEGRADED'?'warn':state==='AVAIL'?'':'bad';}
+// A pool's own counters stay at 0 while a member device has errors: list every vdev with errors.
+function deviceErrors(pool) {
+  const found=[], walk=(vdev,depth)=>{if(depth>8)return;for(const child of vdev.children||[]){if(child.read || child.write || child.checksum)found.push(child);walk(child,depth+1);}};
+  if(pool?.vdevs?.[0])walk(pool.vdevs[0],0);
+  return found;
+}
+function deviceErrorText(pool) {
+  const found=deviceErrors(pool);if(!found.length)return 'None';
+  const one=v=>[['read',v.read],['write',v.write],['checksum',v.checksum]].filter(([,n])=>n).map(([kind,n])=>n+' '+kind).join(', ')+' ('+v.name+')';
+  return found.slice(0,3).map(one).join('; ')+(found.length>3?'; +'+(found.length-3)+' more':'');
+}
+// ZFS's state text stays, but an ONLINE pool with any open issue is not shown as healthy.
+function poolStateClass(pool,alerts) {
+  const base=stateClass(pool.state);
+  return base==='good' && (alerts.length || deviceErrors(pool).length)?'warn':base;
+}
+// Pool order: not ONLINE (or unknown), data errors, device errors, capacity, scrub issues, healthy.
+const POOL_RANKS={agent:0,pool:0,'data-errors':1,errors:2,vdev:2,capacity:3,'scrub-errors':4,'scrub-age':4};
+function poolRank(pool,alerts) {
+  if(!pool)return alerts.length?0:6;
+  if(pool.state!=='ONLINE')return 0;
+  return Math.min(deviceErrors(pool).length?2:5,...alerts.map(a=>POOL_RANKS[a.rule]??4));
+}
+// Issue text names times in UTC for ntfy; the dashboard shows them in the viewer's format.
+function alertText(alert) {
+  const time=alert.time;
+  return time && typeof time.text==='string' && time.text && alert.text.includes(time.text)?alert.text.replace(time.text,()=>reportDate(time.at,time.text)):alert.text;
+}
 function percent(part,whole) {return whole>0?Math.min(100,Math.floor(part/whole*100)):null;}
 function scanProgress(scan) {
   if(scan?.state!=='scanning')return '';
@@ -813,7 +846,9 @@ function poolCard(host,pool,index,lastKnown) {
   const alerts=poolAlerts(host,pool.name), key=host.id+':'+pool.name, titleId='pool-title-'+index;
   const card=node('article','pool-card'+(alerts.length?' pool-attention':''));card.setAttribute('aria-labelledby',titleId);
   const heading=node('div','pool-heading'), title=node('h4','',pool.name);title.id=titleId;
-  heading.append(title,node('span','pill '+stateClass(pool.state),pool.state+(lastKnown?' · last known':'')));
+  const badge=node('span','pill '+poolStateClass(pool,alerts),pool.state+(lastKnown?' · last known':''));
+  if(badge.className.endsWith('warn') && pool.state==='ONLINE')badge.title='ONLINE, with open storage issues';
+  heading.append(title,badge);
   card.append(heading);
   const capacity=alerts.find(a=>a.rule==='capacity'), cap=pool.capacityPercent;
   const meter=node('div','capacity');
@@ -822,13 +857,14 @@ function poolCard(host,pool,index,lastKnown) {
   const fill=node('span');fill.style.width=(cap||0)+'%';bar.append(fill);meter.append(bar);card.append(meter);
   const facts=node('dl','pool-facts'), fact=(label,value,className='')=>{const row=node('div',className);row.append(node('dt','',label),node('dd','',value));facts.append(row);};
   const errors=pool.errors;
-  fact('Errors','Read '+errors.read+' · write '+errors.write+' · checksum '+errors.checksum,errors.read || errors.write || errors.checksum?'has-errors':'');
+  fact('Device errors',deviceErrorText(pool),deviceErrors(pool).length?'has-errors':'');
+  fact('Pool errors','Read '+errors.read+' · write '+errors.write+' · checksum '+errors.checksum,errors.read || errors.write || errors.checksum?'has-errors':'');
   fact('Permanent data errors',String(pool.dataErrors),pool.dataErrors?'has-errors':'');
   const scrub=lastScrubText(pool,storageDetail.hostId===host.id?storageDetail.scrubs?.[pool.name]:null);
   fact('Last scrub',scrub.text,scrub.warn?'has-errors':'');
   const progress=scanProgress(pool.scan);if(progress)fact('Now',progress);
   card.append(facts);
-  if(alerts.length){const list=node('ul','pool-alerts');list.setAttribute('aria-label','Issues in '+pool.name);list.append(...alerts.map(a=>node('li',a.severity==='high'?'bad':'',a.text)));card.append(list);}
+  if(alerts.length){const list=node('ul','pool-alerts');list.setAttribute('aria-label','Issues in '+pool.name);list.append(...alerts.map(a=>node('li',a.severity==='high'?'bad':'',alertText(a))));card.append(list);}
   const root=pool.vdevs?.[0], devices=node('details','pool-devices');devices.dataset.key=key;devices.open=openDevices.has(key);
   const summary=node('summary','','Devices · '+(root?deviceCount(root):0));
   devices.append(summary);
@@ -859,7 +895,8 @@ function renderStorageHost(host) {
   $('storage-status').textContent=storageDetail.error || (snapshot && storage?.state==='ok' && !pools.length?'This host reports no imported pools.':'');
   $('storage-retry').hidden=!storageDetail.error;$('storage-retry').disabled=storageDetail.loading;
   const focusedKey=document.activeElement?.closest?.('.pool-devices')?.dataset.key;
-  $('pool-cards').replaceChildren(...pools.map((pool,index)=>poolCard(host,pool,index,lastKnown)));
+  const ordered=pools.map(pool=>({pool,rank:poolRank(pool,poolAlerts(host,pool.name))})).sort((a,b)=>a.rank-b.rank || a.pool.name.localeCompare(b.pool.name)).map(r=>r.pool);
+  $('pool-cards').replaceChildren(...ordered.map((pool,index)=>poolCard(host,pool,index,lastKnown)));
   if(focusedKey)[...$('pool-cards').querySelectorAll('.pool-devices')].find(el=>el.dataset.key===focusedKey)?.querySelector('summary').focus({preventScroll:true});
   const datasets=storage?.datasets||[], status=storage?.datasetsStatus;
   $('dataset-list').hidden=!datasets.length && !['truncated','report_limit','unavailable'].includes(status);
@@ -875,13 +912,13 @@ function renderPoolRows(rows,total) {
     link.setAttribute('aria-label','View '+(r.pool?'pool '+r.pool.name:'storage host')+' on '+r.host.name);link.onclick=()=>{selectHost(r.host.id);$('containers').focus({preventScroll:true});};
     name.append(link,node('span','row-host',r.host.name+(r.stale?' · last known status':'')));
     // Narrow screens drop the capacity and issue columns; this line carries them.
-    name.append(node('span','mobile-details',(r.pool && r.pool.capacityPercent!==null?r.pool.capacityPercent+'% used · ':'')+(r.alerts.length?r.alerts.length+' issue'+(r.alerts.length===1?'':'s')+': '+r.alerts[0].text:'No issues')));
-    const state=node('td');if(r.pool)state.append(node('span','pill '+stateClass(r.pool.state),r.pool.state));else state.append(node('span','pill bad','Unknown'));
+    name.append(node('span','mobile-details',(r.pool && r.pool.capacityPercent!==null?r.pool.capacityPercent+'% used · ':'')+(r.alerts.length?r.alerts.length+' issue'+(r.alerts.length===1?'':'s')+': '+alertText(r.alerts[0]):'No issues')));
+    const state=node('td');if(r.pool)state.append(node('span','pill '+poolStateClass(r.pool,r.alerts),r.pool.state));else state.append(node('span','pill bad','Unknown'));
     const cap=node('td','pool-capacity desktop-detail');
     if(r.pool && r.pool.capacityPercent!==null){const alert=r.alerts.find(a=>a.rule==='capacity'),bar=node('div','capacity-bar'+(alert?' '+(alert.severity==='high'?'bad':'warn'):''));bar.setAttribute('aria-hidden','true');const fill=node('span');fill.style.width=r.pool.capacityPercent+'%';bar.append(fill);cap.append(node('span','',r.pool.capacityPercent+'%'),bar);}
     else cap.textContent='—';
     const issues=node('td','pool-issues desktop-detail');
-    if(r.alerts.length){issues.append(node('span','pill '+(r.alerts.some(a=>a.severity==='high')?'bad':'warn'),r.alerts.length+' issue'+(r.alerts.length===1?'':'s')),node('span','issue-text',r.alerts[0].text));}
+    if(r.alerts.length){issues.append(node('span','pill '+(r.alerts.some(a=>a.severity==='high')?'bad':'warn'),r.alerts.length+' issue'+(r.alerts.length===1?'':'s')),node('span','issue-text',alertText(r.alerts[0])));}
     else issues.append(node('span','no-check','None'));
     row.append(name,state,cap,issues);return row;
   }));

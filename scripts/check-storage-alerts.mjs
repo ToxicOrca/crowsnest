@@ -80,7 +80,7 @@ try {
   assert.equal(sent.length,1);
   const scrubLine=nas.lines(sent).find(l=>l.includes('scrub finished'));
   assert.deepEqual(nas.lines(sent),['Alert: zfstest/disk3: read 0, write 0, checksum 16 error(s)',scrubLine]);
-  assert.match(scrubLine,/^Alert: zfstest: scrub finished \S+ repaired 2\.0 MiB with 0 error\(s\)$/);
+  assert.match(scrubLine,/^Alert: zfstest: scrub finished \d{1,2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4}, \d\d:\d\d UTC repaired 2\.0 MiB with 0 error\(s\)$/);
   assert.equal(sent[0].priority,4);
   assert.equal(new URL(sent[0].click).searchParams.get('host'),nas.id);
   assert.deepEqual(await nas.send(fixture('captured-scenarios/08-checksum-errors-after-scrub')),[],'unchanged errors are not repeated');
@@ -201,7 +201,7 @@ try {
   const old=fixture('captured-scenarios/04-scrub-finished',40*DAY);
   sent=await age.send(old);
   assert.equal(sent.length,1);
-  assert.match(age.lines(sent)[0],/^Alert: zfstest: last completed scrub \(\S+\) is older than 35 days$/);
+  assert.match(age.lines(sent)[0],/^Alert: zfstest: last completed scrub \(\d{1,2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4}, \d\d:\d\d UTC\) is older than 35 days$/);
   assert.equal(sent[0].priority,3);
   // A resilver hides the last scrub in zpool status; the remembered scrub still counts.
   const resilver=fixture('captured-scenarios/06-resilver-in-progress');
@@ -218,7 +218,7 @@ try {
   // Remembered scrub 40 days old, made by editing the state the server keeps.
   const remembered=age.state();remembered.pools.zfstest.lastScrub.endTime=iso(Date.now()-40*DAY);age.setState(remembered);
   const resilvered=fixture('captured-scenarios/07-resilver-finished');
-  assert.match(age.lines(await age.send(resilvered)).join('|'),/Alert: zfstest: last completed scrub \(\S+\) is older than 35 days/);
+  assert.match(age.lines(await age.send(resilvered)).join('|'),/Alert: zfstest: last completed scrub \(\d{1,2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4}, \d\d:\d\d UTC\) is older than 35 days/);
   await settings({storageScrubDays:60});
   assert.deepEqual(age.lines(await age.send(resilvered)).filter(l=>l.includes('scrub')),[],'a longer period is not a recovery');
   await settings({storageScrubDays:35});
@@ -229,7 +229,7 @@ try {
   assert.equal(neverReport.storage.pools[0].scan,null);
   assert.deepEqual(await never.send(neverReport),[],'a new pool is not overdue on day one');
   const watched=never.state();watched.pools.zfstest.firstSeen=iso(Date.now()-36*DAY);never.setState(watched);
-  assert.deepEqual(never.lines(await never.send(neverReport)),['Alert: zfstest: never scrubbed in 35 days']);
+  assert.deepEqual(never.lines(await never.send(neverReport)),['Alert: zfstest: never scrubbed']);
   const unseen=await enroll('nas-unseen');
   assert.ok(!unseen.lines(await unseen.send(fixture('captured-scenarios/07-resilver-finished'))).some(l=>l.includes('scrub')));
   const unseenState=unseen.state();unseenState.pools.zfstest.firstSeen=iso(Date.now()-36*DAY);unseen.setState(unseenState);
@@ -238,7 +238,7 @@ try {
   // A scrub that found errors.
   const found=await enroll('nas-found');
   sent=await found.send(fixture('synthetic/checksum-errors'));
-  assert.ok(found.lines(sent).some(l=>/^Alert: tank: scrub finished \S+ repaired 1\.0 MiB with 2 error\(s\)$/.test(l)),found.lines(sent).join('|'));
+  assert.ok(found.lines(sent).some(l=>/^Alert: tank: scrub finished \d{1,2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4}, \d\d:\d\d UTC repaired 1\.0 MiB with 2 error\(s\)$/.test(l)),found.lines(sent).join('|'));
   // Permanent data errors alert like counters: a decrease is a new baseline, zero clears.
   assert.ok(found.lines(sent).includes('Alert: tank: 2 permanent data error(s); zpool status -v lists the affected files'),found.lines(sent).join('|'));
   const fewer=fixture('synthetic/checksum-errors');fewer.storage.pools[0].dataErrors=1;
