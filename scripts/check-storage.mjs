@@ -434,7 +434,8 @@ print(json.dumps(out))`,JSON.stringify([...accepted,...rejected])],{encoding:'ut
   assert.match(boardContext.storageTokenCommand(await viaBoard.json()),/^sudo bash <<'CROWSNEST_STORAGE_TOKEN'\n/);
   assert.throws(()=>boardContext.storageTokenCommand({tokenCommand:'rm -rf /'}),/incomplete/);
   // Credential replacement keeps the host-local salt and therefore every vdev name.
-  for(const format of ['compose','config','setup','update'])assert.equal((await call('/api/hosts/'+id+'/collector','POST',{format})).status,400,format);
+  for(const format of ['compose','config','update'])assert.equal((await call('/api/hosts/'+id+'/collector','POST',{format})).status,400,format);
+  assert.equal((await call('/api/hosts/'+id+'/collector','POST',{format:'setup'})).status,409,'a reporting storage host replaces its token instead of repeating setup');
   assert.equal((await call('/api/hosts/'+docker.hostId+'/collector','POST',{format:'storage-token'})).status,400);
   const replacement=await (await call('/api/hosts/'+id+'/collector','POST',{format:'storage-token'})).json();
   const newToken=replacement.tokenCommand.match(/config\["hostToken"\] = "([^"]+)"/)[1];

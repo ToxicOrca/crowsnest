@@ -4,8 +4,14 @@ import {readFile} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 import {createHash} from 'node:crypto';
 import {readCollectorMetadata} from './collector-metadata.mjs';
+import vm from 'node:vm';
+import {agentReports} from './storage-fixtures.mjs';
 const root = fileURLToPath(new URL('../', import.meta.url));
 const {version}=JSON.parse(await readFile(root+'package.json','utf8'));
+// Storage issues use the Worker's own rules, so the preview shows what a real dashboard would.
+const storageRules=vm.createContext({});vm.runInContext(await readFile(root+'worker/storage.js','utf8')+'\nthis.api={storageAttention,storageScrubStatus,STORAGE_ALERT_DEFAULTS};',storageRules);
+const {storageAttention,storageScrubStatus,STORAGE_ALERT_DEFAULTS}=storageRules.api;
+const storageAgentVersion=JSON.parse(await readFile(root+'storage-agent/version.json','utf8')).version;
 const collectorRelease=readCollectorMetadata(root+'collector/version.json');
 const containerId=name=>createHash('sha256').update(name).digest('hex');
 const ago = seconds => new Date(Date.now() - seconds * 1000).toISOString();
@@ -49,6 +55,20 @@ function fixtures() {
     host.snapshot.resourceSampling='complete';
     for(const [number,c] of host.snapshot.containers.entries())if(c.state==='running')c.resources={cpuPercent:3.6+number*2.4,memoryBytes:(48+number*64)*1048576,memoryLimitBytes:1073741824,sampleSeconds:30};
   }
+  // Storage hosts, built from the synthetic ZFS fixtures (fictional pools) with renamed pools.
+  // A finished scrub in a report matches the scrub the server remembers for that pool.
+  const pool=(fixture,name,scrubbedAgo)=>{const p=structuredClone(agentReports[fixture].storage.pools[0]);p.name=name;p.vdevs[0].name=name;
+    if(scrubbedAgo && p.scan?.state==='finished')Object.assign(p.scan,{startTime:ago(scrubbedAgo+5400),endTime:ago(scrubbedAgo)});return p;};
+  const harbor={kind:'storage',containers:[],agentVersion:storageAgentVersion,agentProtocol:1,receivedAt:ago(18),storage:{state:'ok',error:null,zfsVersion:'2.4.1-1',
+    pools:[pool('synthetic/faulted-vdev','tank',50*86400),pool('synthetic/capacity-92','bulk',6*86400),pool('synthetic/scrub-in-progress','fastpool'),pool('synthetic/never-scrubbed','backup')],
+    datasetsStatus:'complete',datasets:[{name:'tank',used:257949696,available:195915264,referenced:98304,quota:null,mountpoint:'/tank'},{name:'tank/archive',used:201326592,available:195915264,referenced:201326592,quota:null,mountpoint:'/tank/archive'},{name:'tank/home',used:56623104,available:46137344,referenced:56623104,quota:104857600,mountpoint:'/tank/home'},{name:'bulk',used:462422016,available:40894464,referenced:462422016,quota:null,mountpoint:'/bulk'}]}};
+  const quarry={kind:'storage',containers:[],agentVersion:storageAgentVersion,agentProtocol:1,receivedAt:ago(25),storage:{state:'error',error:'permission_denied',zfsVersion:null,pools:[],datasetsStatus:'disabled'}};
+  const settings={...STORAGE_ALERT_DEFAULTS,hostReports:true};
+  data.hosts.push(
+    {id:'demo-harbor',name:'harbor',kind:'storage',staleAfterSeconds:180,group:'Home',snapshot:harbor,storageAlerts:storageAttention(harbor,{pools:{tank:{lastScrub:{endTime:ago(50*86400),errors:0,repairedBytes:0}},bulk:{lastScrub:{endTime:ago(6*86400),errors:0,repairedBytes:0}},fastpool:{lastScrub:{endTime:ago(20*86400),errors:0,repairedBytes:0}},backup:{firstSeen:ago(40*86400)}}},settings,Date.now())},
+    {id:'demo-quarry',name:'quarry',kind:'storage',staleAfterSeconds:180,group:'Home',snapshot:quarry,storageAlerts:storageAttention(quarry,null,settings,Date.now())},
+  );
+  data.storageHosts=true;data.availableStorageAgentVersion=storageAgentVersion;
   data.hosts[0].alertSignals=[{containerId:containerId('immich-server'),kind:'memoryAlerts',text:'immich-server: memory above 128 MiB for at least 5 minute(s)'}];
   return data;
 }
@@ -67,6 +87,11 @@ const server = createServer(async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   if(url.pathname==='/api/notifications' && req.method==='GET') {
     res.setHeader('Content-Type','application/json');res.end(JSON.stringify({configured:true,destination:'https://ntfy.example.com/crowsnest-illustrative-private-topic',authenticated:true,enabled:true,recoveries:true,hostReports:true,unhealthy:true,restarting:true,dead:true,cpuAlerts:true,cpuThreshold:150,memoryAlerts:true,memoryMiB:128,resourceMinutes:5,restartBursts:true,restartCount:5,restartWindowMinutes:10,cooldownMinutes:10,staleMinutes:5,priority:4,lastSuccessAt:ago(180),lastSweepAt:ago(90)}));return;
+  }
+  if(url.pathname==='/api/storage' && req.method==='GET') {
+    const host=fixtures().hosts.find(h=>h.id===url.searchParams.get('host'));
+    const remembered={tank:{lastScrub:{endTime:ago(50*86400),errors:0,repairedBytes:0}},bulk:{lastScrub:{endTime:ago(6*86400),errors:0,repairedBytes:0}},fastpool:{lastScrub:{endTime:ago(20*86400),errors:0,repairedBytes:0}}};
+    res.setHeader('Content-Type','application/json');res.end(JSON.stringify({scrubs:Object.fromEntries((host?.snapshot?.storage?.pools||[]).map(p=>[p.name,storageScrubStatus(p,remembered[p.name])])),history:[]}));return;
   }
   if(url.pathname==='/api/resources' && req.method==='GET'){res.setHeader('Content-Type','application/json');res.end(JSON.stringify({samples:resourceFixtures(url.searchParams.get('host'),url.searchParams.get('container')),windowSeconds:300,retentionHours:24}));return;}
   if(url.pathname==='/api/history' && req.method==='GET') {

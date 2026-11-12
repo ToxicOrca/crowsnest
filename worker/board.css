@@ -335,3 +335,66 @@ dialog label { display: block; margin: 24px 0 8px; font-size: 13px; font-weight:
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; }
 }
+/* ZFS storage hosts. */
+dialog:not([data-kind="storage"]) .storage-only, [data-kind="storage"] .docker-only { display: none !important; }
+.host-kind { border: 0; padding: 0; margin: 18px 0 4px; }
+.host-kind legend { padding: 0; font-weight: 600; font-size: 13px; }
+.host-kind .checkbox-label { margin: 10px 0; align-items: flex-start; flex-wrap: wrap; }
+.host-kind .checkbox-label input { margin-top: 3px; }
+.host-kind .input-help { flex-basis: 100%; margin: 0 0 0 28px; }
+.storage-view { border-bottom: 1px solid var(--line); }
+.storage-view > .alert { margin: 18px 24px 0; }
+.storage-status { margin: 12px 24px 0; font-size: 13px; color: var(--muted); }
+.storage-status:empty { display: none; }
+.storage-retry { margin: 12px 24px 0; }
+.pool-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr)); gap: 16px; padding: 20px 24px; }
+.pool-card { background: var(--raised); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px 18px; min-width: 0; }
+.pool-card.pool-attention { border-color: #756043; }
+.pool-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px 12px; flex-wrap: wrap; }
+.pool-heading h4 { margin: 0; font-size: 16px; overflow-wrap: anywhere; }
+.capacity { margin: 14px 0 16px; }
+.capacity-label { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.2; }
+.capacity-detail { font-size: 12px; color: var(--muted); margin: 3px 0 8px; font-variant-numeric: tabular-nums; }
+.capacity-bar { height: 8px; background: #0f1821; border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
+.capacity-bar span { display: block; height: 100%; background: var(--green); }
+.capacity-bar.warn span { background: var(--orange); }
+.capacity-bar.bad span { background: var(--red); }
+.pool-facts { margin: 0; display: grid; gap: 8px; }
+.pool-facts div { display: grid; grid-template-columns: minmax(8.5em, 38%) 1fr; gap: 12px; font-size: 13px; }
+.pool-facts dt { color: var(--muted); }
+.pool-facts dd { margin: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.pool-facts .has-errors dd { color: var(--orange); }
+.pool-alerts { margin: 14px 0 0; padding: 10px 12px 10px 28px; background: #352c1f; border: 1px solid #756043; border-radius: 6px; font-size: 13px; color: #f5d6a7; }
+.pool-alerts li + li { margin-top: 4px; }
+.pool-alerts li.bad { color: #f9c9cc; }
+.pool-devices { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 10px; }
+.pool-devices > summary { cursor: pointer; font-size: 13px; font-weight: 600; padding: 4px 0; }
+.vdev-list { list-style: none; margin: 0; padding-left: 14px; border-left: 1px solid var(--line); }
+.vdev-root { padding-left: 0; border-left: 0; margin-top: 8px; }
+.vdev-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; padding: 6px 0; font-size: 13px; }
+.vdev-name { font-family: ui-monospace, monospace; overflow-wrap: anywhere; }
+.vdev-role, .vdev-type { margin-left: 8px; font: 11px system-ui, sans-serif; color: var(--muted); }
+.vdev-errors { margin-left: auto; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.vdev-errors.has-errors { color: var(--orange); }
+.dataset-list { padding: 0 24px 20px; }
+.dataset-list > summary { cursor: pointer; font-size: 13px; padding: 8px 0; }
+.dataset-list .table-wrap { margin-top: 8px; }
+.dataset-list th:first-child, .dataset-list td:first-child { padding-left: 16px; }
+.dataset-list td:first-child { width: auto; }
+.storage-fleet { border-top: 1px solid var(--line); }
+.section-title { font-size: 15px; margin: 0; padding: 18px 24px 10px; }
+.storage-fleet .panel-note { padding: 0 24px; }
+.pool-capacity .capacity-bar { width: 96px; margin-top: 5px; }
+.pool-issues .pill { margin-bottom: 2px; }
+.issue-text { display: block; font-size: 12px; color: var(--muted); margin-top: 3px; overflow-wrap: anywhere; }
+@media (max-width: 600px) {
+  .storage-view > .alert { margin: 16px 16px 0; }
+  .storage-status, .storage-retry { margin-left: 16px; margin-right: 16px; }
+  .pool-cards { padding: 16px; gap: 12px; }
+  .pool-card { padding: 14px; }
+  .pool-facts div { grid-template-columns: 1fr; gap: 0; }
+  .vdev-errors { margin-left: 0; flex-basis: 100%; }
+  .dataset-list { padding: 0 16px 16px; }
+  .section-title { padding: 16px 16px 8px; }
+  .storage-fleet .panel-note { padding: 0 16px; }
+}

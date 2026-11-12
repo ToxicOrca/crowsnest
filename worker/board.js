@@ -10,6 +10,9 @@ let initialLinkApplied = false;
 let resourceHost = null, resourceSamples = [], resourceError = '', resourceLoading = false, resourceSequence = 0, resourceController = null;
 let availableCollectorVersion = null, collectorUpdateTarget = null, collectorUpdateRequestedAt = 0, collectorUpdatePreviousVersion = null, collectorUpdateBusy = false;
 let collectorProtocol = null, minimumCollectorProtocol = null;
+let availableStorageAgentVersion = null, storageHostsEnabled = false, storageOnly = false, setupKind = 'docker';
+let storageDetail = {hostId: null, scrubs: null, error: '', loading: false}, storageSequence = 0, storageController = null;
+const openDevices = new Set();
 let detailSelection = null, detailEvents = [], detailHistoryError = '', detailHistoryLoading = false, detailHistorySequence = 0, detailHistoryController = null, detailLegacyMatches = false;
 const $ = id => document.getElementById(id);
 if(document.body.dataset.authMode==='standalone'){
@@ -22,6 +25,10 @@ if(document.body.dataset.authMode==='standalone'){
 }
 const age = iso => Math.max(0, Math.floor((Date.now() - Date.parse(iso)) / 1000));
 const needsAttention = c => c.health === 'unhealthy' || ['restarting', 'dead'].includes(c.state);
+const isStorage = h => h?.kind === 'storage';
+const storagePools = h => h?.snapshot?.storage?.pools || [];
+const storageAlerts = h => isStorage(h) ? h.storageAlerts || [] : [];
+const poolAlerts = (h, name) => storageAlerts(h).filter(a => a.pool === name);
 const inMaintenance = h => Date.parse(h?.maintenanceUntil) > Date.now();
 const maintenanceText = h => 'Notifications paused until '+new Date(h.maintenanceUntil).toLocaleString();
 function duration(seconds) {
@@ -58,7 +65,16 @@ function syncGroupControl() {
   }
   $('host-group-filter').value=hostGroup;
 }
+function storageAgentInfo(host) {
+  const version=host.snapshot?.agentVersion, comparison=compareCollectorVersions(version,availableStorageAgentVersion);
+  if(!host.snapshot)return {text:'Storage agent awaiting first report',short:'',comparison};
+  if(!validCollectorVersion(version))return {text:'Storage agent version unknown',short:'Storage agent version unknown',comparison};
+  const fresh=hostState(host)==='Reporting' && !lastError;
+  const status=comparison===0?'current':comparison===-1?'this dashboard ships v'+availableStorageAgentVersion:comparison===1?'newer than this dashboard’s agent':'available version unknown';
+  return {text:'Storage agent v'+version+' · '+status+(fresh?'':' (last reported)'),short:'Storage agent v'+version+(comparison===-1?' · update available':''),comparison};
+}
 function collectorInfo(host) {
+  if(host?.kind==='storage')return storageAgentInfo(host);
   const version=host?.snapshot?.collectorVersion;
   const comparison=compareCollectorVersions(version,availableCollectorVersion);
   if(!host?.snapshot)return {text:'Collector awaiting first report',short:'',comparison};
@@ -71,6 +87,7 @@ function collectorInfo(host) {
   return {text:'Collector v'+version+' · '+status+(fresh?'':' (last reported)'),short:'Collector v'+version+(required?' · update required':dashboardRequired?' · update dashboard':comparison===-1?' · update available':''),comparison,required,dashboardRequired};
 }
 function updaterInfo(host) {
+  if(host?.kind==='storage')return {policy:'The storage agent does not update itself. Agent updates are manual.',result:''};
   const status=host?.snapshot?.updateStatus;
   if(!status)return {policy:'Updater status not reported. Automatic updates require explicit setup on the host.',result:''};
   const suffix=hostState(host)==='Reporting' && !lastError?'':' (last reported)';
@@ -107,15 +124,16 @@ function syncHosts() {
       buttons.set(host.id,button);
     }
     const state = hostState(host);
-    const issueCount = host.snapshot?.containers.filter(needsAttention).length || 0;
+    const issueCount = isStorage(host) ? storageAlerts(host).length : host.snapshot?.containers.filter(needsAttention).length || 0;
     button.className = 'host' + (host.id === selected ? ' selected' : '');
     button.setAttribute('aria-pressed', String(host.id === selected));
     button.querySelector('strong').textContent = host.name;
     button.querySelector('.host-issues').textContent = issueCount ? issueCount + (issueCount === 1 ? ' issue' : ' issues') : '';
     const stateEl = button.querySelector('.host-state');
     stateEl.className = 'host-state' + (state === 'Reporting' ? ' good' : state === 'Stale' ? ' warn' : '');
-    const count = host.snapshot?.containers.length;
-    stateEl.textContent = inMaintenance(host) ? 'Maintenance · '+state : state + (host.snapshot ? ' · ' + count + (count === 1 ? ' container' : ' containers') : '');
+    const count = isStorage(host) ? storagePools(host).length : host.snapshot?.containers.length, noun = isStorage(host) ? ' pool' : ' container';
+    const unreadable = host.snapshot?.storage?.state === 'error';
+    stateEl.textContent = inMaintenance(host) ? 'Maintenance · '+state : state + (host.snapshot ? ' · ' + (unreadable ? 'ZFS unreadable' : count + noun + (count === 1 ? '' : 's')) : '');
     const collector=collectorInfo(host), collectorEl=button.querySelector('.host-collector');
     collectorEl.textContent=collector.short;collectorEl.className='host-collector'+(collector.comparison===-1?' warn':'');
     button.querySelector('.host-group-name').textContent=host.group||'';
@@ -185,21 +203,27 @@ function render() {
   const scope=scopedHosts(),paused=scope.filter(inMaintenance);
   $('maintenance-banner').hidden=!paused.length;
   $('maintenance-banner').textContent=host && paused.length?host.name+': '+maintenanceText(host)+'. Health and activity stay visible.':paused.length+' host'+(paused.length===1?' is':'s are')+' in maintenance. Automatic notifications are paused for those hosts; health and activity stay visible.';
-  $('search').placeholder=fleet?'Search containers, images, or hosts':'Search containers or images';
+  const pools=fleet?scope.filter(h=>isStorage(h) && h.snapshot).flatMap(h=>{
+    const stale=hostState(h)==='Stale', rows=storagePools(h).map(pool=>({host:h,pool,alerts:poolAlerts(h,pool.name),stale}));
+    // A storage host whose agent cannot read ZFS still needs a row: its pools are unknown.
+    return rows.length?rows:[{host:h,pool:null,alerts:storageAlerts(h),stale}];
+  }):[];
+  $('search').placeholder=fleet?(pools.length?'Search containers, images, hosts, or pools':'Search containers, images, or hosts'):'Search containers or images';
   $('search').setAttribute('aria-label',$('search').placeholder);
   const stale = !!snapshot && age(snapshot.receivedAt) > staleAfterSeconds(host);
   $('containers').setAttribute('aria-busy', String(!loaded && loading));
   $('host-title').textContent = host ? host.name : hostGroup?(hostGroup==='_ungrouped'?'Ungrouped':hostGroup)+' hosts':'All hosts';
   $('fleet-view').querySelector('strong').textContent=hostGroup?'All hosts in group':'All hosts';
   $('table-caption').textContent = host ? 'Containers on ' + host.name : hostGroup?'Containers in '+$('host-title').textContent:'Containers across all Docker hosts';
-  $('engine').textContent = snapshot ? 'Docker Engine ' + snapshot.engineVersion : host ? 'Start the collector to begin reporting' : loaded ? 'Latest collector reports across your fleet' : 'Loading reports…';
+  $('engine').textContent = snapshot ? (isStorage(host) ? storageEngineText(snapshot) : 'Docker Engine ' + snapshot.engineVersion) : host ? (isStorage(host) ? 'Run the storage agent setup to begin reporting' : 'Start the collector to begin reporting') : loaded ? (scope.some(isStorage) ? 'Latest collector and storage agent reports across your fleet' : 'Latest collector reports across your fleet') : 'Loading reports…';
+  $('view-containers').textContent = isStorage(host) ? 'Pools' : 'Containers';
   $('host-status').textContent = host ? hostState(host) : loaded ? scope.filter(h=>hostState(h)==='Reporting').length + ' reporting' : 'Loading';
   $('host-status').className = 'status' + (stale ? ' warn' : snapshot ? ' good' : '');
   $('manage-host').hidden = !host;
   $('resume-setup').hidden = !host || !!snapshot;
   const containers = scope.flatMap(h=>(h.snapshot?.containers||[]).map(c=>({...c,hostId:h.id,hostName:h.name,reportAt:h.snapshot.receivedAt,stale:hostState(h)==='Stale'})));
   const issues = containers.filter(needsAttention).length;
-  $('summary').hidden = inspecting || view !== 'containers' || (!snapshot && !fleet) || !hosts.length;
+  $('summary').hidden = inspecting || view !== 'containers' || (!snapshot && !fleet) || !hosts.length || isStorage(host);
   $('total').textContent = containers.length;
   $('running').textContent = containers.filter(c => c.state === 'running').length;
   $('attention').textContent = issues;
@@ -210,20 +234,31 @@ function render() {
   $('connection').textContent = stale ? 'Last known status' : fleet ? 'Latest across hosts' : 'Every 30 seconds';
   $('notice').hidden = !lastError && !stale && !setupSuccess;
   $('notice').className = 'alert' + (lastError ? ' error' : '');
-  $('notice').textContent = lastError || (stale ? 'No report from ' + host.name + ' for ' + duration(age(snapshot.receivedAt)) + '. These are its last known states. Check the collector on this host.' : setupSuccess);
+  $('notice').textContent = lastError || (stale ? 'No report from ' + host.name + ' for ' + duration(age(snapshot.receivedAt)) + '. These are its last known states. Check the ' + (isStorage(host) ? 'storage agent' : 'collector') + ' on this host.' : setupSuccess);
   const query = $('search').value.trim().toLowerCase();
   const visible = containers.filter(c => (!attentionOnly || needsAttention(c)) && (!query || [c.name,c.image,c.hostName,c.composeProject,c.composeService].join(' ').toLowerCase().includes(query)))
     .sort((a, b) => Number(needsAttention(b)) - Number(needsAttention(a)) || a.name.localeCompare(b.name));
-  $('table-tools').hidden = inspecting || view !== 'containers' || !containers.length;
+  const poolAttention = pools.filter(r => r.alerts.length).length;
+  const visiblePools = pools.filter(r => (!storageOnly || r.alerts.length) && (!query || [r.pool?.name, r.host.name].join(' ').toLowerCase().includes(query)))
+    .sort((a, b) => Number(!!b.alerts.length) - Number(!!a.alerts.length) || a.host.name.localeCompare(b.host.name) || (a.pool?.name || '').localeCompare(b.pool?.name || ''));
+  $('table-tools').hidden = inspecting || view !== 'containers' || (!containers.length && !pools.length);
+  $('attention-filter').hidden = $('compose-group').hidden = !containers.length;
+  $('storage-filter').hidden = !pools.length;
+  $('storage-filter').setAttribute('aria-pressed', String(storageOnly));
+  $('storage-filter-count').textContent = poolAttention;
   $('attention-filter').setAttribute('aria-pressed', String(attentionOnly));
   $('compose-group').setAttribute('aria-pressed',String(groupByProject));
   $('filter-count').textContent = issues;
   $('table-wrap').hidden = inspecting || view !== 'containers' || !visible.length;
   $('table-footer').hidden = inspecting || view !== 'containers' || !containers.length;
   $('row-count').textContent = visible.length + ' of ' + containers.length + ' containers';
-  $('empty').hidden = inspecting || view !== 'containers' || !!visible.length;
+  // A storage host has its own panel; a fleet of only storage hosts shows just the pools table.
+  $('empty').hidden = inspecting || view !== 'containers' || !!visible.length || isStorage(host) || (fleet && !containers.length && !!pools.length);
   $('empty-add').hidden = !loaded || !!host || !!lastError || !!hosts.length;
   $('clear-filters').hidden = !containers.length || !!visible.length;
+  $('storage-fleet').hidden = inspecting || view !== 'containers' || !pools.length;
+  if(!$('storage-fleet').hidden)renderPoolRows(visiblePools, pools.length);
+  renderStorageHost(host);
   $('empty-logo').hidden = !!hosts.length || !loaded || !!lastError;
   if (loaded && !helpInitialized) {
     $('setup-help').open = !hosts.length && !lastError;
@@ -274,6 +309,7 @@ async function loadHosts() {
     const data = await response.json();
     if (!Array.isArray(data.hosts)) throw new Error('Unexpected status response. Try Refresh.');
     hosts = data.hosts;availableCollectorVersion=validCollectorVersion(data.availableCollectorVersion)?data.availableCollectorVersion:null;
+    availableStorageAgentVersion=validCollectorVersion(data.availableStorageAgentVersion)?data.availableStorageAgentVersion:null;storageHostsEnabled=data.storageHosts===true;
     collectorProtocol=Number.isSafeInteger(data.collectorProtocol) && data.collectorProtocol>0?data.collectorProtocol:null;
     minimumCollectorProtocol=Number.isSafeInteger(data.minimumCollectorProtocol) && data.minimumCollectorProtocol>0?data.minimumCollectorProtocol:null;
     if (selected !== null && !hosts.some(h => h.id === selected)) selected = null;
@@ -291,14 +327,17 @@ async function loadHosts() {
     if(view==='activity') loadHistory();
     if(detailSelection && !detailHistoryLoading)loadContainerHistory();
     if($('resource-history').open && (selected || detailSelection) && !resourceLoading)loadResourceHistory();
+    if(isStorage(hosts.find(h=>h.id===selected)) && !storageDetail.loading)loadStorageDetail();
   }
 }
 function selectHost(id) {
   closeContainerDetails(false);
-  selected=id; attentionOnly=false; $('search').value=''; setupSuccess='';
+  selected=id; attentionOnly=false; storageOnly=false; $('search').value=''; setupSuccess='';
+  if(storageDetail.hostId!==id){storageSequence++;storageController?.abort();storageDetail={hostId:id,scrubs:null,error:'',loading:false};openDevices.clear();}
   setDashboardLink(id);
   historyEvents=[]; historyError=''; historySequence++;
   render(); if(view==='activity') loadHistory();
+  if(isStorage(hosts.find(h=>h.id===id)))loadStorageDetail();
 }
 function setDashboardLink(hostId,containerId=null) {
   const url=new URL(location.href);
@@ -350,8 +389,8 @@ function renderResourceOverview() {
     resourceHost=id;resourceSamples=[];resourceError='';resourceLoading=false;resourceSequence++;resourceController?.abort();
     $('resource-history').open=false;$('resource-readings').open=false;
   }
-  $('resource-history').hidden=!host || view!=='containers';
-  if(!host)return;
+  $('resource-history').hidden=!host || view!=='containers' || isStorage(host);
+  if(!host || isStorage(host))return;
   const report=host.snapshot, running=report?.containers.filter(c=>c.state==='running')||[];
   const container=detailSelection?report?.containers.find(c=>c.id===detailSelection.containerId):null;
   const total=key=>detailSelection?(container?.state==='running'?container.resources?.[key]:null):report?.resourceSampling && running.every(c=>c.resources?.[key]!=null)?running.reduce((n,c)=>n+c.resources[key],0):null;
@@ -468,7 +507,8 @@ function updateCollectorVersion() {
   const info=collectorInfo(host);
   const updater=updaterInfo(host);
   $('managed-collector-version').textContent=info.text;
-  $('managed-collector-freshness').textContent=host.snapshot?'Last report: '+reportDate(host.snapshot.receivedAt)+'. Recommended collector: '+(availableCollectorVersion?'v'+availableCollectorVersion:'unknown')+'.':'The first report will show this collector’s version.';
+  const recommended=isStorage(host)?availableStorageAgentVersion:availableCollectorVersion;
+  $('managed-collector-freshness').textContent=host.snapshot?'Last report: '+reportDate(host.snapshot.receivedAt)+'. Recommended '+(isStorage(host)?'storage agent':'collector')+': '+(recommended?'v'+recommended:'unknown')+'.':'The first report will show this '+(isStorage(host)?'agent':'collector')+'’s version.';
   $('managed-auto-updates').textContent=updater.policy;
   $('managed-update-result').textContent=updater.result;
   $('prepare-update').disabled=collectorUpdateBusy || info.comparison===1 || info.dashboardRequired;
@@ -482,8 +522,9 @@ function alerts() {
   const result=[];
   for(const h of scopedHosts()) {
     const state=hostState(h);
-    if(state==='Stale') result.push({host:h,text:'No report for '+duration(age(h.snapshot.receivedAt))+'. Container states are last known.'});
-    if(!h.snapshot && age(h.createdAt)>600) result.push({host:h,text:'Enrollment has not received a first report. Continue setup or check collector logs.'});
+    if(state==='Stale') result.push({host:h,text:'No report for '+duration(age(h.snapshot.receivedAt))+'. '+(isStorage(h)?'Pool':'Container')+' states are last known.'});
+    if(!h.snapshot && age(h.createdAt)>600) result.push({host:h,text:'Enrollment has not received a first report. Continue setup or check '+(isStorage(h)?'storage agent':'collector')+' logs.'});
+    for(const alert of storageAlerts(h))result.push({host:h,text:alert.text+(state==='Stale'?' (last known)':'')});
     for(const c of h.snapshot?.containers||[]) if(needsAttention(c)) result.push({host:h,containerId:c.id,text:c.name+' · '+c.state+' · '+c.health+(state==='Stale'?' (last known)':'')});
     if(state!=='Stale' && !lastError)for(const signal of h.alertSignals||[])result.push({host:h,containerId:signal.containerId,text:signal.text});
   }
@@ -532,10 +573,27 @@ function setupStage(stage) {
     if(index===stage)$('step-'+id).setAttribute('aria-current','step');
   }
   const name=$('setup-host-name').textContent;
-  $('setup-description').textContent=stage===0?'Name your host here. Prepare and start its collector in a terminal on that host.':stage===3?'Crowsnest checks for a real collector report from '+name+'.':'Run these steps in a terminal on '+name+', then continue here.';
+  const agent=setupKind==='storage'?'storage agent':'collector';
+  $('setup-description').textContent=stage===0?'Name your host here. Prepare and start its '+agent+' in a terminal on that host.':stage===3?'Crowsnest checks for a real '+agent+' report from '+name+'.':'Run these steps in a terminal on '+name+', then continue here.';
   $('setup-form').hidden=stage!==0; $('setup-deploy').hidden=stage!==1; $('setup-start').hidden=stage!==2; $('setup-wait').hidden=stage!==3;
 }
+function setSetupKind(kind) {
+  setupKind=kind==='storage'?'storage':'docker';const storage=setupKind==='storage';
+  $('setup').dataset.kind=setupKind;$('kind-'+setupKind).checked=true;
+  $('setup-title').textContent=storage?'Connect a ZFS storage host':'Connect a Docker host';
+  $('step-start').lastChild.textContent=storage?'Start agent':'Start collector';
+  $('setup-start-label').textContent=storage?'Start the storage agent':'Start the collector';
+  $('wait-report').textContent=storage?'I’ve started the agent':'I’ve started the collector';
+  $('enrollment-help').textContent=storage?'Reports arrive every 60 seconds. If nothing arrives after two minutes, check the agent logs on the host.':'Reports arrive every 30 seconds. If nothing arrives after a minute, check the collector logs on the host.';
+  if(!$('setup-form').hidden)setupStage(0);
+  updateCommands();
+}
 function updateCommands() {
+  if(setupKind==='storage') {
+    $('deploy-commands').textContent='sudo systemctl daemon-reload &&\nsudo systemctl enable --now crowsnest-storage';
+    $('log-command').textContent='sudo journalctl -u crowsnest-storage -n 30 --no-pager';
+    return;
+  }
   const docker=$('sudo-docker').checked?'sudo docker':'docker';
   $('deploy-commands').textContent='cd /srv/docker/crowsnest-collector &&\n'+docker+' compose config --quiet &&\n'+docker+' compose up -d';
   $('transfer-commands').textContent='test ! -e /srv/docker/crowsnest-collector &&\nsudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" /srv/docker/crowsnest-collector &&\ncd /srv/docker/crowsnest-collector &&\n(umask 077\n tar --keep-old-files -xf ~/Downloads/crowsnest-collector.tar &&\n printf \'COLLECTOR_UID=%s\\nCOLLECTOR_GID=%s\\n\' "$(id -u)" "$(id -g)" > .env)';
@@ -545,6 +603,7 @@ function openSetup() {
   setupSession++;enrollmentId=null;clearSetupPackage();
   $('prepare').disabled=false;$('prepare').textContent='Prepare setup';
   $('setup-form').reset();$('sudo-docker').checked=true;$('hostname').setCustomValidity('');
+  $('host-kind').hidden=!storageHostsEnabled;for(const id of ['kind-docker','kind-storage'])$(id).disabled=false;setSetupKind('docker');
   $('hostname').removeAttribute('aria-invalid');$('setup-message').hidden=true;
   setupStage(0);$('setup').showModal();$('hostname').focus();
 }
@@ -558,16 +617,17 @@ async function preparePackage(response,name,resumed,session) {
   if(!setupCurrent(session)){await response.body?.cancel();return;}
   const data=await response.json();
   if(!setupCurrent(session))return;
-  if(!/^[a-f0-9-]{36}$/.test(data.hostId) || typeof data.setupCommand!=='string' || !data.setupCommand || typeof data.packageBase64!=='string')throw new Error('The setup response is incomplete. Close and choose Continue setup.');
-  const archive=Uint8Array.from(atob(data.packageBase64),c=>c.charCodeAt(0));
-  if(packageUrl)URL.revokeObjectURL(packageUrl);
+  const storage=setupKind==='storage';
+  if(!/^[a-f0-9-]{36}$/.test(data.hostId) || typeof data.setupCommand!=='string' || !data.setupCommand || (storage?data.kind!=='storage' || !data.setupCommand.startsWith("sudo bash <<'CROWSNEST_STORAGE_SETUP'\n"):typeof data.packageBase64!=='string'))throw new Error('The setup response is incomplete. Close and choose Continue setup.');
+  const archive=storage?null:Uint8Array.from(atob(data.packageBase64),c=>c.charCodeAt(0));
+  if(packageUrl){URL.revokeObjectURL(packageUrl);packageUrl=null;}
   enrollmentId=data.hostId;setupCommand=data.setupCommand;
   $('setup-copy-text').value='';$('setup-copy-fallback').hidden=true;$('setup-copy-status').textContent='';$('deploy-copy-status').textContent='';$('transfer-copy-status').textContent='';$('transfer-details').open=false;
   $('copy-deploy').textContent='Copy start commands';$('copy-transfer').textContent='Copy commands';
-  packageUrl=URL.createObjectURL(new Blob([archive],{type:'application/x-tar'}));
-  $('package-download').href=packageUrl;$('setup-host-name').textContent=name;
-  $('setup-terminal-host').textContent=name;$('setup-start-host').textContent=name;
-  $('setup-expiry').textContent=resumed?'Start this collector within ten minutes. If that window expires, close and choose Continue setup again.':'';
+  if(archive){packageUrl=URL.createObjectURL(new Blob([archive],{type:'application/x-tar'}));$('package-download').href=packageUrl;}
+  $('setup-host-name').textContent=name;
+  $('setup-terminal-host').textContent=name;$('setup-storage-host').textContent=name;$('setup-start-host').textContent=name;
+  $('setup-expiry').textContent=resumed?'Start this '+(storage?'agent':'collector')+' within ten minutes. If that window expires, close and choose Continue setup again.':'';
   updateCommands(); setupStage(1);
   await refresh();
   if(setupCurrent(session)){selectHost(data.hostId);$('copy-setup').focus();}
@@ -576,7 +636,8 @@ function updateEnrollment() {
   if(enrollmentId && $('setup').open) {
     const host=hosts.find(h=>h.id===enrollmentId), connected=!!host?.snapshot;
     $('enrollment-title').textContent=connected?host.name+' is reporting':'Waiting for the first report';
-    $('enrollment-status').textContent=connected?'Connected. The latest report contains '+host.snapshot.containers.length+' containers.':lastError||'Checking every 15 seconds while your collector starts.';
+    const poolCount=storagePools(host).length;
+    $('enrollment-status').textContent=connected?(isStorage(host)?(host.snapshot.storage?.state==='error'?'Connected, but the agent cannot read ZFS. Open the host for details.':'Connected. The latest report contains '+poolCount+' pool'+(poolCount===1?'':'s')+'.'):'Connected. The latest report contains '+host.snapshot.containers.length+' containers.'):lastError||'Checking every 15 seconds while your '+(setupKind==='storage'?'storage agent':'collector')+' starts.';
     $('enrollment-help').hidden=connected;$('log-command').parentElement.hidden=connected;
     $('finish-setup').textContent=connected?'View host':'Close';
     if(connected){const changed=$('setup-wait').hidden;setupStage(3);if(changed)$('finish-setup').focus();}
@@ -589,6 +650,7 @@ function updateEnrollment() {
 async function resumeSetup() {
   const host=hosts.find(h=>h.id===selected);if(!host)return;
   openSetup();$('hostname').value=host.name;$('prepare').disabled=true;
+  setSetupKind(host.kind);for(const id of ['kind-docker','kind-storage'])$(id).disabled=true;
   const session=setupSession;
   try{await preparePackage(await mutate('/api/hosts/'+host.id+'/collector','POST',{format:'setup'}),host.name,true,session);}
   catch(error){if(setupCurrent(session))showError('setup-message',error);}
@@ -609,7 +671,8 @@ $('add').onclick=openSetup;$('empty-add').onclick=openSetup;
 for(const id of ['cancel','cancel-bottom','finish-setup'])$(id).onclick=()=>{$('setup').close();};
 $('setup').addEventListener('close',()=>{if($('setup').open)return;setupSession++;enrollmentId=null;clearSetupPackage();});
 $('refresh').onclick=()=>refresh();$('fleet-view').onclick=()=>selectHost(null);
-$('search').oninput=render;$('sudo-docker').onchange=updateCommands;$('copy-setup').onclick=copySetup;
+$('search').oninput=render;$('sudo-docker').onchange=updateCommands;
+for(const id of ['kind-docker','kind-storage'])$(id).onchange=()=>{if($(id).checked){setSetupKind($(id).value);$('setup-message').hidden=true;}};$('copy-setup').onclick=copySetup;
 $('copy-deploy').onclick=()=>copyCommands('deploy-commands','copy-deploy','deploy-copy-status','Copy start commands','Start commands');
 $('copy-transfer').onclick=()=>copyCommands('transfer-commands','copy-transfer','transfer-copy-status','Copy commands','Extract commands');
 $('files-prepared').onclick=()=>{setupStage(2);$('copy-deploy').focus();};
@@ -620,14 +683,15 @@ $('resume-setup').onclick=resumeSetup;
 for(const key of ['containers','activity','alerts'])$('view-'+key).onclick=()=>{closeContainerDetails(false);view=key;render();if(key==='activity')loadHistory();if(key==='alerts')loadNotifications();};
 $('attention-filter').onclick=()=>{attentionOnly=!attentionOnly;render();};
 $('compose-group').onclick=()=>{groupByProject=!groupByProject;render();};
-$('clear-filters').onclick=()=>{attentionOnly=false;$('search').value='';render();$('search').focus();};
+$('storage-filter').onclick=()=>{storageOnly=!storageOnly;render();};
+$('clear-filters').onclick=()=>{attentionOnly=false;storageOnly=false;$('search').value='';render();$('search').focus();};
 $('hostname').oninput=()=>{$('hostname').setCustomValidity('');$('hostname').removeAttribute('aria-invalid');};
 $('setup-form').onsubmit=async event=>{
   event.preventDefault();const name=$('hostname').value.trim();
   if(!/^[a-zA-Z0-9][a-zA-Z0-9 ._-]{0,63}$/.test(name)){$('hostname').setCustomValidity('Start with a letter or number. Use letters, numbers, spaces, dots, dashes, or underscores.');$('hostname').reportValidity();return;}
   $('prepare').disabled=true;$('prepare').textContent='Preparing…';$('setup-message').hidden=true;
   const session=setupSession;
-  try{await preparePackage(await mutate('/api/hosts','POST',{name,format:'setup'}),name,false,session);}
+  try{await preparePackage(await mutate('/api/hosts','POST',setupKind==='storage'?{name,kind:'storage',format:'setup'}:{name,format:'setup'}),name,false,session);}
   catch(error){if(setupCurrent(session))showError('setup-message',error);}
   finally{if(setupCurrent(session)){$('prepare').disabled=false;$('prepare').textContent='Prepare setup';}}
 };
@@ -635,6 +699,7 @@ $('manage-host').onclick=()=>{
   const host=hosts.find(h=>h.id===selected);if(!host)return;managementSession++;managedId=host.id;
   collectorUpdateBusy=false;for(const id of ['rename-save','maintenance-save','maintenance-end','rotate-token'])$(id).disabled=false;
   $('management-title').textContent='Manage '+host.name;$('rename-host').value=host.name;
+  $('management').dataset.kind=isStorage(host)?'storage':'docker';$('collector-version-title').textContent=isStorage(host)?'Storage agent version':'Collector version';
   $('rename-group').value=host.group||'';
   $('host-groups').replaceChildren(...[...new Set(hosts.map(h=>h.group).filter(Boolean))].sort().map(group=>{const option=node('option');option.value=group;return option;}));
   $('remove-name').value='';$('remove-host').disabled=true;$('remove-label').textContent='Enter “'+host.name+'” to confirm';
@@ -683,7 +748,7 @@ $('remove-form').onsubmit=async event=>{
   if(!host || $('remove-name').value!==host.name)return;
   const id=managedId, session=managementSession;
   $('remove-host').disabled=true;
-  try{await mutate('/api/hosts/'+id,'DELETE',{confirmName:$('remove-name').value});if(managementCurrent(session,id))$('management').close();if(selected===id)selected=null;setupSuccess='Host removed. Stop its collector on the host with docker compose down.';await refresh();}
+  try{await mutate('/api/hosts/'+id,'DELETE',{confirmName:$('remove-name').value});if(managementCurrent(session,id))$('management').close();if(selected===id)selected=null;setupSuccess=isStorage(host)?'Host removed. Stop its storage agent with sudo systemctl disable --now crowsnest-storage.':'Host removed. Stop its collector on the host with docker compose down.';await refresh();}
   catch(error){if(managementCurrent(session,id)){showError('management-message',error);$('remove-host').disabled=false;}}
 };
 $('rotate-token').onclick=async()=>{
@@ -707,6 +772,138 @@ $('rotate-token').onclick=async()=>{
     $('rotation-result').hidden=false;updateEnrollment();$('config-download').focus();
   }catch(error){if(managementCurrent(session,id))showError('management-message',error);}finally{if(managementCurrent(session,id))$('rotate-token').disabled=false;}
 };
+// ZFS storage hosts. Issues come from the server (storageAlerts), computed with the ntfy rules.
+const STORAGE_ROLES={special:'special',dedup:'dedup',log:'log',l2cache:'cache',spare:'spare'};
+const STORAGE_ERROR_HELP={zfs_unavailable:'ZFS tools or /dev/zfs are unavailable on the host.',unsupported_version:'OpenZFS 2.3 or newer is required for JSON status.',permission_denied:'The crowsnest-storage user cannot read ZFS status (check /dev/zfs permissions).',command_failed:'A zpool or zfs command failed; check the agent logs.',timeout:'A zpool or zfs command timed out; check the agent logs.',invalid_output:'The agent could not read the zpool or zfs output.',limit_exceeded:'The host has more pools or devices than Crowsnest reports.',report_limit:'The storage report exceeded the size limit.'};
+function storageEngineText(snapshot) {
+  const storage=snapshot.storage;
+  return storage?.state==='error'?'ZFS status unavailable':storage?.zfsVersion?'OpenZFS '+storage.zfsVersion:'OpenZFS version unknown';
+}
+function stateClass(state) {return state==='ONLINE'?'good':state==='DEGRADED'?'warn':state==='AVAIL'?'':'bad';}
+function percent(part,whole) {return whole>0?Math.min(100,Math.floor(part/whole*100)):null;}
+function scanProgress(scan) {
+  if(scan?.state!=='scanning')return '';
+  const done=percent(scan.examinedBytes,scan.totalBytes);
+  return (scan.type==='resilver'?'Resilver':'Scrub')+' in progress'+(done===null?'':' · '+done+'% examined')+(Date.parse(scan.startTime)>0?' · started '+reportDate(scan.startTime):'');
+}
+// The server remembers the last finished scrub (a resilver hides it in zpool status); fall back to this report.
+function lastScrubText(pool,scrub) {
+  const scan=pool.scan, seen=scan?.type==='scrub' && scan.state==='finished' && scan.endTime?{endTime:scan.endTime,errors:scan.errors,repairedBytes:scan.repairedBytes}:null;
+  // Scrub details load separately, so this report can hold a newer finished scrub: show the newer one.
+  const remembered=scrub?.status==='known'?scrub:null, status=scrub?.status||(pool.scan===null?'never':seen?'known':'unknown');
+  const last=!remembered?seen:!seen?remembered:Date.parse(seen.endTime)>Date.parse(remembered.endTime)?seen:remembered;
+  if(status==='never')return {text:'Never scrubbed',warn:false};
+  if(!last)return {text:'No completed scrub seen yet',warn:false};
+  const found=last.errors>0 || last.repairedBytes>0;
+  return {text:reportDate(last.endTime)+' · '+duration(age(last.endTime))+' ago · repaired '+formatBytes(last.repairedBytes||0)+' · '+last.errors+' error'+(last.errors===1?'':'s'),warn:found};
+}
+function vdevItem(vdev,depth) {
+  const item=node('li','vdev'), row=node('div','vdev-row'), name=node('span','vdev-name',vdev.name);
+  const role=STORAGE_ROLES[vdev.class];
+  if(role)name.append(node('span','vdev-role',role));
+  if(vdev.children?.length && !['root','file','disk'].includes(vdev.type))name.append(node('span','vdev-type',vdev.type));
+  const counts=vdev.read || vdev.write || vdev.checksum;
+  row.append(name,node('span','pill '+stateClass(vdev.state),vdev.state),node('span','vdev-errors'+(counts?' has-errors':''),'Read '+vdev.read+' · write '+vdev.write+' · checksum '+vdev.checksum));
+  item.append(row);
+  if(vdev.children?.length && depth<8){const list=node('ul','vdev-list');list.append(...vdev.children.map(child=>vdevItem(child,depth+1)));item.append(list);}
+  return item;
+}
+function deviceCount(vdev) {return (vdev.children||[]).reduce((n,child)=>n+1+deviceCount(child),0);}
+function poolCard(host,pool,index,lastKnown) {
+  const alerts=poolAlerts(host,pool.name), key=host.id+':'+pool.name, titleId='pool-title-'+index;
+  const card=node('article','pool-card'+(alerts.length?' pool-attention':''));card.setAttribute('aria-labelledby',titleId);
+  const heading=node('div','pool-heading'), title=node('h4','',pool.name);title.id=titleId;
+  heading.append(title,node('span','pill '+stateClass(pool.state),pool.state+(lastKnown?' · last known':'')));
+  card.append(heading);
+  const capacity=alerts.find(a=>a.rule==='capacity'), cap=pool.capacityPercent;
+  const meter=node('div','capacity');
+  meter.append(node('div','capacity-label',cap===null?'Capacity unknown':cap+'% used'),node('div','capacity-detail',formatBytes(pool.allocated)+' of '+formatBytes(pool.size)+' · '+formatBytes(pool.free)+' free'+(pool.fragmentationPercent===null?'':' · '+pool.fragmentationPercent+'% fragmented')));
+  const bar=node('div','capacity-bar'+(capacity?' '+(capacity.severity==='high'?'bad':'warn'):''));bar.setAttribute('aria-hidden','true');
+  const fill=node('span');fill.style.width=(cap||0)+'%';bar.append(fill);meter.append(bar);card.append(meter);
+  const facts=node('dl','pool-facts'), fact=(label,value,className='')=>{const row=node('div',className);row.append(node('dt','',label),node('dd','',value));facts.append(row);};
+  const errors=pool.errors;
+  fact('Errors','Read '+errors.read+' · write '+errors.write+' · checksum '+errors.checksum,errors.read || errors.write || errors.checksum?'has-errors':'');
+  fact('Permanent data errors',String(pool.dataErrors),pool.dataErrors?'has-errors':'');
+  const scrub=lastScrubText(pool,storageDetail.hostId===host.id?storageDetail.scrubs?.[pool.name]:null);
+  fact('Last scrub',scrub.text,scrub.warn?'has-errors':'');
+  const progress=scanProgress(pool.scan);if(progress)fact('Now',progress);
+  card.append(facts);
+  if(alerts.length){const list=node('ul','pool-alerts');list.setAttribute('aria-label','Issues in '+pool.name);list.append(...alerts.map(a=>node('li',a.severity==='high'?'bad':'',a.text)));card.append(list);}
+  const root=pool.vdevs?.[0], devices=node('details','pool-devices');devices.dataset.key=key;devices.open=openDevices.has(key);
+  const summary=node('summary','','Devices · '+(root?deviceCount(root):0));
+  devices.append(summary);
+  if(pool.vdevsTruncated)devices.append(node('p','input-help','Large tree: only devices with problems or errors are listed.'));
+  const list=node('ul','vdev-list vdev-root');list.setAttribute('aria-label','Devices in '+pool.name);
+  if(root)list.append(...(root.children||[]).map(child=>vdevItem(child,1)));
+  devices.append(list);
+  devices.addEventListener('toggle',()=>{if(devices.open)openDevices.add(key);else openDevices.delete(key);});
+  card.append(devices);
+  return card;
+}
+function renderStorageHost(host) {
+  const show=isStorage(host) && view==='containers' && !detailSelection;
+  $('storage-view').hidden=!show;if(!show)return;
+  const snapshot=host.snapshot, storage=snapshot?.storage, pools=storagePools(host), stale=hostState(host)==='Stale', lastKnown=stale || !!lastError;
+  const agentAlert=storageAlerts(host).find(a=>a.rule==='agent');
+  const warning=!snapshot?'Waiting for the first storage agent report. Choose Continue setup for the setup command, or check the agent with: sudo journalctl -u crowsnest-storage -n 30':
+    storage?.state==='error'?(agentAlert?.text||'The storage agent cannot read ZFS.')+'. '+(STORAGE_ERROR_HELP[storage.error]||'')+' Pool states are unknown until it can read ZFS again.':'';
+  $('storage-warning').hidden=!warning;$('storage-warning').textContent=warning;
+  // With an agent error the pool counts are unknown, not zero.
+  $('storage-view').querySelector('.storage-summary').hidden=!snapshot || storage?.state==='error';
+  $('pool-cards').hidden=!pools.length;
+  const attention=pools.filter(p=>poolAlerts(host,p.name).length).length;
+  $('storage-pools').textContent=pools.length;$('storage-healthy').textContent=pools.length-attention;
+  $('storage-attention').textContent=attention;$('storage-attention').className=attention?'has-issues':'';
+  $('storage-last').textContent=snapshot?duration(age(snapshot.receivedAt))+' ago':'—';$('storage-last').title=snapshot?new Date(snapshot.receivedAt).toLocaleString():'';
+  $('storage-connection').textContent=stale?'Last known status':'Every 60 seconds';
+  $('storage-status').textContent=storageDetail.error || (snapshot && storage?.state==='ok' && !pools.length?'This host reports no imported pools.':'');
+  $('storage-retry').hidden=!storageDetail.error;$('storage-retry').disabled=storageDetail.loading;
+  const focusedKey=document.activeElement?.closest?.('.pool-devices')?.dataset.key;
+  $('pool-cards').replaceChildren(...pools.map((pool,index)=>poolCard(host,pool,index,lastKnown)));
+  if(focusedKey)[...$('pool-cards').querySelectorAll('.pool-devices')].find(el=>el.dataset.key===focusedKey)?.querySelector('summary').focus({preventScroll:true});
+  const datasets=storage?.datasets||[], status=storage?.datasetsStatus;
+  $('dataset-list').hidden=!datasets.length && !['truncated','report_limit','unavailable'].includes(status);
+  $('dataset-count').textContent=datasets.length;
+  $('dataset-note').textContent=status==='truncated'?'Only the first '+datasets.length+' datasets are reported.':status==='report_limit'?'Datasets were omitted to keep the report within the size limit.':status==='unavailable'?'The agent could not list datasets.':'Each pool’s root dataset and its direct children.';
+  $('dataset-rows').replaceChildren(...datasets.map(d=>{const row=node('tr');row.append(node('td','code-value',d.name),node('td','number',formatBytes(d.used)),node('td','number',formatBytes(d.available)),node('td','number desktop-detail',formatBytes(d.referenced)),node('td','number desktop-detail',d.quota?formatBytes(d.quota):'None'),node('td','desktop-detail code-value',d.mountpoint??'—'));return row;}));
+}
+function renderPoolRows(rows,total) {
+  const focused=document.activeElement?.dataset?.poolKey;
+  $('pool-rows').replaceChildren(...rows.map(r=>{
+    const row=node('tr',(r.alerts.length?'row-attention ':'')+(r.stale || lastError?'row-stale':'')), name=node('td');
+    const link=node('button','container-link',r.pool?r.pool.name:'No pools reported');link.dataset.poolKey=r.host.id+':'+(r.pool?.name??'');
+    link.setAttribute('aria-label','View '+(r.pool?'pool '+r.pool.name:'storage host')+' on '+r.host.name);link.onclick=()=>{selectHost(r.host.id);$('containers').focus({preventScroll:true});};
+    name.append(link,node('span','row-host',r.host.name+(r.stale?' · last known status':'')));
+    // Narrow screens drop the capacity and issue columns; this line carries them.
+    name.append(node('span','mobile-details',(r.pool && r.pool.capacityPercent!==null?r.pool.capacityPercent+'% used · ':'')+(r.alerts.length?r.alerts.length+' issue'+(r.alerts.length===1?'':'s')+': '+r.alerts[0].text:'No issues')));
+    const state=node('td');if(r.pool)state.append(node('span','pill '+stateClass(r.pool.state),r.pool.state));else state.append(node('span','pill bad','Unknown'));
+    const cap=node('td','pool-capacity desktop-detail');
+    if(r.pool && r.pool.capacityPercent!==null){const alert=r.alerts.find(a=>a.rule==='capacity'),bar=node('div','capacity-bar'+(alert?' '+(alert.severity==='high'?'bad':'warn'):''));bar.setAttribute('aria-hidden','true');const fill=node('span');fill.style.width=r.pool.capacityPercent+'%';bar.append(fill);cap.append(node('span','',r.pool.capacityPercent+'%'),bar);}
+    else cap.textContent='—';
+    const issues=node('td','pool-issues desktop-detail');
+    if(r.alerts.length){issues.append(node('span','pill '+(r.alerts.some(a=>a.severity==='high')?'bad':'warn'),r.alerts.length+' issue'+(r.alerts.length===1?'':'s')),node('span','issue-text',r.alerts[0].text));}
+    else issues.append(node('span','no-check','None'));
+    row.append(name,state,cap,issues);return row;
+  }));
+  $('pool-table-wrap').hidden=!rows.length;
+  $('storage-fleet-empty').hidden=!!rows.length;
+  $('storage-fleet-empty').textContent=storageOnly?'No pools need attention.':'No matching pools.';
+  $('pool-count').textContent=rows.length+' of '+total+' pools';
+  if(focused)[...$('pool-rows').querySelectorAll('.container-link')].find(el=>el.dataset.poolKey===focused)?.focus({preventScroll:true});
+}
+async function loadStorageDetail() {
+  const id=selected;if(!isStorage(hosts.find(h=>h.id===id)))return;
+  const sequence=++storageSequence;storageController?.abort();storageController=new AbortController();
+  storageDetail={...storageDetail,hostId:id,loading:true};
+  try {
+    const response=await fetch('/api/storage?host='+encodeURIComponent(id),{cache:'no-store',signal:AbortSignal.any([storageController.signal,AbortSignal.timeout(10000)])});
+    if(!response.ok)throw new Error('Unable to load scrub details. Scrub dates shown come from the latest report. Choose Retry scrub details.');
+    const data=await response.json();if(!data || typeof data.scrubs!=='object' || data.scrubs===null)throw new Error('Unexpected storage response. Choose Retry scrub details.');
+    if(sequence===storageSequence)storageDetail={hostId:id,scrubs:data.scrubs,error:'',loading:false};
+  }catch(error){if(sequence===storageSequence && error.name!=='AbortError')storageDetail={...storageDetail,error:error.name==='TimeoutError'?'Scrub details timed out. Choose Retry scrub details.':error.message,loading:false};}
+  finally{if(sequence===storageSequence){storageDetail.loading=false;const focused=document.activeElement;renderStorageHost(hosts.find(h=>h.id===selected));restoreFocus(focused,$('storage-retry'));}}
+}
+$('storage-retry').onclick=loadStorageDetail;
 // Storage hosts replace only the token in place (their vdev-name salt is kept);
 // Docker hosts receive a new collector.json.
 function credentialFormat(host) {return host?.kind==='storage'?'storage-token':'config';}
@@ -741,6 +938,8 @@ if (context?.registerTool) {
 let notificationBusy=false, notificationConfigured=false;
 const signalCheckboxes=['cpuAlerts','memoryAlerts','restartBursts'];
 const signalValues={cpuThreshold:150,memoryMiB:1024,resourceMinutes:5,restartCount:5,restartWindowMinutes:10,cooldownMinutes:10};
+const storageCheckboxes=['storagePoolAlerts','storageVdevAlerts','storageErrorAlerts','storageScrubErrorAlerts','storageScrubAgeAlerts','storageCapacityAlerts'];
+const storageValues={storageScrubDays:35,storageCapacityWarn:80,storageCapacityHigh:90};
 function setSubscription(value) {
   let url;
   try{url=new URL(value);if(url.protocol!=='https:' || url.username || url.password || url.search || url.hash || !/^\/[a-zA-Z0-9_-]{1,64}$/.test(url.pathname))url=null;}catch{}
@@ -760,10 +959,17 @@ function notificationControls() {
   $('notifications-memoryMiB').disabled ||= !$('notifications-memoryAlerts').checked;
   $('notifications-resourceMinutes').disabled ||= !$('notifications-cpuAlerts').checked && !$('notifications-memoryAlerts').checked;
   for(const key of ['restartCount','restartWindowMinutes'])$('notifications-'+key).disabled ||= !$('notifications-restartBursts').checked;
-  $('notifications-cooldownMinutes').disabled ||= !signalCheckboxes.some(key=>$('notifications-'+key).checked);
+  for(const key of [...storageCheckboxes,...Object.keys(storageValues)])$('notifications-'+key).disabled=notificationBusy || !notificationConfigured || !storageHostsEnabled;
+  $('notifications-storageScrubDays').disabled ||= !$('notifications-storageScrubAgeAlerts').checked;
+  for(const key of ['storageCapacityWarn','storageCapacityHigh'])$('notifications-'+key).disabled ||= !$('notifications-storageCapacityAlerts').checked;
+  // Storage error, capacity and device alerts share the cooldown too.
+  const storageCooled=storageHostsEnabled && ['storageVdevAlerts','storageErrorAlerts','storageCapacityAlerts'].some(key=>$('notifications-'+key).checked);
+  $('notifications-cooldownMinutes').disabled ||= !signalCheckboxes.some(key=>$('notifications-'+key).checked) && !storageCooled;
+  $('storage-rules').hidden=!storageHostsEnabled;
 }
 $('notifications-hostReports').onchange=notificationControls;
-for(const key of signalCheckboxes)$('notifications-'+key).onchange=notificationControls;
+for(const key of [...signalCheckboxes,...storageCheckboxes])$('notifications-'+key).onchange=notificationControls;
+for(const key of ['storageCapacityWarn','storageCapacityHigh'])$('notifications-'+key).oninput=()=>$('notifications-storageCapacityHigh').setCustomValidity('');
 async function loadNotifications() {
   if(notificationBusy)return;
   const focused=document.activeElement;
@@ -778,6 +984,8 @@ async function loadNotifications() {
     $('notifications-delay').value=String(data.staleMinutes||2);$('notifications-priority').value=String(data.priority||4);
     for(const key of signalCheckboxes)$('notifications-'+key).checked=data[key]===true;
     for(const [key,fallback] of Object.entries(signalValues))$('notifications-'+key).value=String(data[key]??fallback);
+    for(const key of storageCheckboxes)$('notifications-'+key).checked=data[key]!==false;
+    for(const [key,fallback] of Object.entries(storageValues))$('notifications-'+key).value=String(data[key]??fallback);
     $('notification-delivery').textContent=data.lastError?'Delivery failed: '+data.lastError+'. Automatic alerts retry with backoff. Check ntfy access and the runtime token.':data.lastSuccessAt?'Last accepted by ntfy: '+new Date(data.lastSuccessAt).toLocaleString()+'.':'No notifications have been accepted yet.';
     $('notification-delivery').textContent+=' '+(data.lastSweepAt?'Last background check: '+new Date(data.lastSweepAt).toLocaleString()+'.':'No background check recorded. Configure a scheduled sweep for stale-host alerts.');
   }catch(error){notificationConfigured=false;setSubscription(null);$('notification-destination').textContent='Notification settings unavailable.';$('notification-message').textContent=error.message;}
@@ -785,8 +993,10 @@ async function loadNotifications() {
 }
 $('notification-form').onsubmit=async event=>{
   event.preventDefault();const focused=document.activeElement;
+  if(storageHostsEnabled && Number($('notifications-storageCapacityWarn').value)>=Number($('notifications-storageCapacityHigh').value)){$('notifications-storageCapacityHigh').setCustomValidity('Set the high threshold above the warning threshold.');$('storage-rules').open=true;$('notifications-storageCapacityHigh').reportValidity();return;}
+  const storageSettings=storageHostsEnabled?{...Object.fromEntries(storageCheckboxes.map(key=>[key,$('notifications-'+key).checked])),...Object.fromEntries(Object.keys(storageValues).map(key=>[key,Number($('notifications-'+key).value)]))}:{};
   notificationBusy=true;notificationControls();$('notification-message').textContent='Saving…';
-  try{await mutate('/api/notifications','PATCH',{enabled:$('notifications-enabled').checked,recoveries:$('notifications-recoveries').checked,...Object.fromEntries(['hostReports','unhealthy','restarting','dead',...signalCheckboxes].map(key=>[key,$('notifications-'+key).checked])),...Object.fromEntries(Object.keys(signalValues).map(key=>[key,Number($('notifications-'+key).value)])),staleMinutes:Number($('notifications-delay').value),priority:Number($('notifications-priority').value)});$('notification-message').textContent='Settings saved. Changes apply to the whole fleet.';}
+  try{await mutate('/api/notifications','PATCH',{enabled:$('notifications-enabled').checked,recoveries:$('notifications-recoveries').checked,...Object.fromEntries(['hostReports','unhealthy','restarting','dead',...signalCheckboxes].map(key=>[key,$('notifications-'+key).checked])),...Object.fromEntries(Object.keys(signalValues).map(key=>[key,Number($('notifications-'+key).value)])),staleMinutes:Number($('notifications-delay').value),priority:Number($('notifications-priority').value),...storageSettings});$('notification-message').textContent='Settings saved. Changes apply to the whole fleet.';}
   catch(error){$('notification-message').textContent=error.message;}
   finally{notificationBusy=false;notificationControls();restoreFocus(focused);}
 };

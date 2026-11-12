@@ -320,7 +320,10 @@ export default {async scheduled(controller,env,ctx) {ctx.waitUntil(sweepNotifica
             const report=snapshot?await snapshot.json():null;
             const active=advancedIssues(report,signals?await signals.json():null,settings).issues;
             const alertSignals=Object.entries(active).map(([key,text])=>({containerId:signalContainer(key),kind:signalKind(key),text}));
-            return {id:h.id,name:h.name,kind:h.kind==='storage'?'storage':'docker',staleAfterSeconds:staleAfterMs(h)/1000,group:h.group||'',createdAt:h.createdAt,credentialRevision:h.tokenRevision||0,maintenanceUntil:maintenance.until||null,alertSignals,snapshot:report};
+            // Storage hosts read their remembered scrubs after this host's other reads finish, keeping the in-flight limit.
+            const state=h.kind==='storage' && report?.storage?await env.BUCKET.get('storage/'+id+'.json'):null;
+            const storageAlerts=h.kind==='storage'?storageAttention(report,state?await state.json():null,settings,Date.now()):undefined;
+            return {id:h.id,name:h.name,kind:h.kind==='storage'?'storage':'docker',staleAfterSeconds:staleAfterMs(h)/1000,group:h.group||'',createdAt:h.createdAt,credentialRevision:h.tokenRevision||0,maintenanceUntil:maintenance.until||null,alertSignals,...storageAlerts?{storageAlerts}:{},snapshot:report};
           }));
           hosts.push(...batch.filter(Boolean));
         } cursor=list.truncated?list.cursor:undefined;
@@ -397,14 +400,16 @@ export default {async scheduled(controller,env,ctx) {ctx.waitUntil(sweepNotifica
       if(hostRoute[2]==='collector' && request.method==='POST') {
         if(Object.keys(data).some(k=>k!=='format'))return json({error:'Choose a collector package or configuration'},400);
         if(host.kind==='storage') {
-          // Storage hosts replace credentials in place; Compose packages and collector updates do not apply.
-          if(data.format!=='storage-token')return json({error:'Storage hosts support token replacement only'},400);
+          // Storage hosts replace credentials in place, or repeat setup before their first report;
+          // Compose packages and collector updates do not apply.
+          if(!['storage-token','setup'].includes(data.format))return json({error:'Storage hosts support setup and token replacement only'},400);
           if(!storageEnabled(env))return json({error:'Storage hosts require a standalone dashboard'},409);
+          if(data.format==='setup' && await env.BUCKET.get('snapshots/'+host.id+'.json'))return json({error:'This storage host already reports. Replace its token instead.'},409);
           const token=crypto.randomUUID()+crypto.randomUUID();
           host.pendingTokenHash=await hash(token);
           host.pendingTokenExpiresAt=new Date(Date.now()+10*60000).toISOString();
           if(!await writeHost(env.BUCKET,obj,host))return json({error:'Host changed. Refresh before preparing credentials.'},409);
-          return json({tokenCommand:storageTokenCommand(token,host.id)});
+          return data.format==='setup'?storageSetup(collectorConfig(env,host.id,token)):json({tokenCommand:storageTokenCommand(token,host.id)});
         }
         if(data.format==='storage-token')return json({error:'Choose a collector package or configuration'},400);
         if(data.format==='update')return json({updateCommand:collectorUpdate(),collectorVersion:COLLECTOR_VERSION});

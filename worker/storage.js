@@ -374,6 +374,16 @@ function storageIssues(snapshot,state,settings,delivered,now) {
   }
   return {issues,uncertain,high,low,counters};
 }
+// Dashboard view of the same rules: every rule on (settings choose what ntfy sends, not what
+// the dashboard shows), the operator's thresholds, and no delivered baseline (no hysteresis).
+function storageAttention(snapshot,state,settings,now) {
+  if(!snapshot?.storage)return [];
+  const rules={...settings,hostReports:true};
+  for(const [key,value] of Object.entries(STORAGE_ALERT_DEFAULTS))if(typeof value==='boolean')rules[key]=true;
+  const result=storageIssues(snapshot,state,rules,{},now);
+  return Object.entries(result.issues).map(([id,text])=>({id,rule:storageAlertRule(id),pool:id.split(':').slice(2).join(':').split('/')[0]||null,
+    severity:result.high.has(id)?'high':result.low.has(id)?'low':'default',text}));
+}
 function storageRecoveryText(id,snapshot) {
   const rule=storageAlertRule(id), target=id.split(':').slice(2).join(':'), [name,vdev]=target.split('/');
   if(rule==='agent')return 'Storage agent can read ZFS again';
