@@ -109,19 +109,22 @@ async function notifyHostUnlocked(env,host,snapshot,settings,now=Date.now()) {
   // It must not announce that a problem recovered because the policy changed.
   for(const [id,text] of Object.entries(saved.delivered)) {
     const kinds=deliveredIssueKinds(id,text,saved);
-    if(!kinds.length || !kinds.some(kind=>settings[kind]))delete saved.delivered[id];
+    if(!kinds.length || !kinds.some(kind=>settings[kind])){delete saved.delivered[id];if(storageAlertRule(id))delete saved.cooldowns?.[id];}
   }
   // A changed storage threshold retires the alerts that depend on it, like a signal policy change.
   const thresholds=storageAlertThresholds(settings);
   for(const [rule,values] of Object.entries(thresholds))if(saved.storageThresholds && JSON.stringify(saved.storageThresholds[rule])!==JSON.stringify(values))
-    for(const id of new Set([...Object.keys(saved.delivered),...Object.keys(saved.cooldowns||{})]))if(storageAlertRule(id)===rule){delete saved.delivered[id];delete saved.cooldowns?.[id];}
+    for(const id of new Set([...Object.keys(saved.delivered),...Object.keys(saved.cooldowns||{})]))if(storageAlertRule(id)===rule) {
+      delete saved.cooldowns?.[id];
+      if(storageThresholdRetires(id,saved.delivered[id],saved.storageThresholds[rule],values))delete saved.delivered[id];
+    }
   saved.storageThresholds=thresholds;
   const current=notificationIssues(host,snapshot,now,settings), added=[], removed=[],addedIds=[];
   const observations=settings.cpuAlerts || settings.memoryAlerts || settings.restartBursts?await env.BUCKET.get('signals/'+host.id+'.json'):null;
   const advanced=advancedIssues(snapshot,observations?await observations.json():null,settings);
   Object.assign(current,advanced.issues);
   for(const id of advanced.uncertain)if(saved.delivered[id])current[id]=saved.delivered[id];
-  let storage=null;
+  let storage=null, held=0;
   saved.storageCounters??={};
   if(host.kind==='storage' && snapshot?.storage && now-Date.parse(snapshot.receivedAt)<=staleAfterMs(host)) {
     const state=await env.BUCKET.get('storage/'+host.id+'.json');
@@ -133,6 +136,15 @@ async function notifyHostUnlocked(env,host,snapshot,settings,now=Date.now()) {
       const old=saved.storageCounters[id];
       if(saved.delivered[id] && old && Object.keys(counts).every(key=>counts[key]<=old[key])){saved.delivered[id]=current[id];saved.storageCounters[id]=counts;}
     }
+    // Flap protection: a pool or vdev recovery needs two consecutive reports without the alert.
+    // Sweeps re-read the same report (same receivedAt), so they never count as the second one.
+    const clearing={};
+    for(const [id,text] of Object.entries(saved.delivered))if(!current[id] && storageAlertHeld(id)) {
+      const first=saved.storageClearing?.[id];
+      clearing[id]=first||snapshot.receivedAt;
+      if(!first || first===snapshot.receivedAt){current[id]=text;held++;}
+    }
+    saved.storageClearing=clearing;
   }
   const blocked=[];
   for(const [id,text] of Object.entries(current))if(saved.delivered[id]!==text) {
@@ -144,15 +156,17 @@ async function notifyHostUnlocked(env,host,snapshot,settings,now=Date.now()) {
   const stale=!snapshot || now-Date.parse(snapshot.receivedAt)>staleAfterMs(host);
   if(stale)removed.length=0;
   // Retain delivered container alerts until a fresh report can resolve them.
-  const baseline=stale?{...saved.delivered,...current}:current;
-  for(const id of blocked)delete baseline[id];
+  const baseline=stale?{...saved.delivered,...current}:{...current};
+  // A blocked change to a delivered storage alert keeps the delivered text (and its counters):
+  // the alert is still on record, so a later recovery or counter reset is judged against it.
+  for(const id of blocked)if(storageAlertCooled(id) && saved.delivered[id])baseline[id]=saved.delivered[id];else delete baseline[id];
   const kinds={...stale?saved.kinds||{}:{},...Object.fromEntries((snapshot?.containers||[]).filter(c=>current[c.id]).map(c=>[c.id,issueKinds(c)])),...current.report?{report:['hostReports']}: {}};
   for(const id of Object.keys(current))if(signalKind(id))kinds[id]=[signalKind(id)];
   // Counters stay with the alert text they were delivered with (the text carries all three counts).
   const counters=Object.fromEntries(Object.keys(baseline).filter(storageAlertCounted)
     .map(id=>[id,baseline[id]===current[id] && storage?.counters[id]?storage.counters[id]:saved.storageCounters[id]]).filter(([,value])=>value));
   const lines=[...added.map(x=>'Alert: '+x),...(settings.recoveries?removed.map(x=>'Cleared: '+x):[])];
-  if(!lines.length){saved.delivered=baseline;saved.kinds=kinds;saved.storageCounters=counters;saved.attempts=0;await env.BUCKET.put(key,JSON.stringify(saved));return {sent:0,pending:blocked.length?1:0};}
+  if(!lines.length){saved.delivered=baseline;saved.kinds=kinds;saved.storageCounters=counters;saved.attempts=0;await env.BUCKET.put(key,JSON.stringify(saved));return {sent:0,pending:blocked.length || held?1:0};}
   if(saved.nextAttemptAt>now)return {sent:0,pending:1};
   let message=host.name+'\n'+lines.slice(0,10).map(x=>x.slice(0,280)).join('\n')+(lines.length>10?'\n'+(lines.length-10)+' more changes. Open Crowsnest for details.':'');
   while(new TextEncoder().encode(message).length>3500)message=message.slice(0,-1);

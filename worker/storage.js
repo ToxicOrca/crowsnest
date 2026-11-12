@@ -294,12 +294,22 @@ function validStorageAlertSettings(data) {
 }
 function storageAlertRule(id) {return typeof id==='string'?(/^zfs:([a-z-]+):/.exec(id)||[])[1]:undefined;}
 function storageAlertKind(id) {return STORAGE_ALERT_KINDS[storageAlertRule(id)];}
-// Counter and capacity alerts can change often; they share the signal cooldown.
-function storageAlertCooled(id) {return ['errors','data-errors','capacity'].includes(storageAlertRule(id));}
+// Counter, capacity and vdev alerts can change often; they share the signal cooldown.
+function storageAlertCooled(id) {return ['errors','data-errors','capacity','vdev'].includes(storageAlertRule(id));}
+// Flap protection: a delivered pool or vdev alert clears only after two consecutive reports
+// without it, and a vdev re-alert waits for the cooldown, so a marginal disk or cable sends at
+// most one alert per window and stays on record while it flaps. Pool alerts stay immediate.
+function storageAlertHeld(id) {return ['pool','vdev'].includes(storageAlertRule(id));}
 // Alerts whose counters only fall on zpool clear, a reboot or a later scrub: a decrease is a new baseline.
 function storageAlertCounted(id) {return ['errors','data-errors'].includes(storageAlertRule(id));}
 // Thresholds an alert's meaning depends on: a change retires those alerts silently, never as a recovery.
 function storageAlertThresholds(settings) {return {capacity:[settings.storageCapacityWarn,settings.storageCapacityHigh],'scrub-age':[settings.storageScrubDays]};}
+// A capacity alert names one threshold (warning or high): only a change to that one retires it.
+function storageThresholdRetires(id,text,before,after) {
+  if(storageAlertRule(id)!=='capacity')return true;
+  const index=text?.endsWith('(high)')?1:0;
+  return before?.[index]!==after[index];
+}
 function storageVdevUnhealthy(node) {
   if(node.type==='root' || node.state==='ONLINE')return false;
   if(node.class==='spare' && node.state==='AVAIL')return false;  // An idle hot spare is healthy.
@@ -369,7 +379,10 @@ function storageRecoveryText(id,snapshot) {
   if(rule==='agent')return 'Storage agent can read ZFS again';
   const pool=snapshot?.storage?.pools?.find(p=>p.name===name);
   if(!pool)return name+': pool no longer reported; check the dashboard';
-  if(vdev!==undefined && !storageNodes(pool.vdevs[0]).some(node=>node.name===vdev))return target+': vdev no longer reported; check the dashboard';
+  const node=vdev===undefined?null:storageNodes(pool.vdevs[0]).find(node=>node.name===vdev);
+  if(vdev!==undefined && !node)return target+': vdev no longer reported; check the dashboard';
+  // A group that leaves FAULTED or UNAVAIL for DEGRADED is not healthy: its members alert on their own.
+  if(rule==='vdev' && node.state!=='ONLINE' && !(node.class==='spare' && node.state==='AVAIL'))return target+': now '+node.state+'; see its member devices';
   return target+': '+({pool:'pool is ONLINE again','data-errors':'no permanent data errors reported',vdev:'vdev is healthy again',errors:'error counters cleared (zpool clear or reboot)',
     'scrub-errors':'a later scrub finished without repairs or errors','scrub-age':'scrubbed recently',capacity:'capacity back below the alert threshold'})[rule];
 }

@@ -14,7 +14,8 @@ const read=key=>objects.has(key)?JSON.parse(objects.get(key)):null;
 const set=(key,value)=>objects.set(key,JSON.stringify(value));
 const clone=value=>JSON.parse(JSON.stringify(value));
 const originalFetch=globalThis.fetch;
-globalThis.fetch=async(url,options)=>{requests.push(JSON.parse(options.body));return new Response(JSON.stringify({id:'test-message',event:'message',topic:'fleet'}));};
+let failNext=0;
+globalThis.fetch=async(url,options)=>{if(failNext>0){failNext--;throw new Error('simulated ntfy outage');}requests.push(JSON.parse(options.body));return new Response(JSON.stringify({id:'test-message',event:'message',topic:'fleet'}));};
 const DAY=86400000, iso=ms=>new Date(ms).toISOString().replace(/\.\d{3}Z$/,'Z');
 // Fixture scans carry real capture dates; move them to "an hour ago" so the check never ages.
 const fresh=(report,endedAgo=3600000)=>{
@@ -46,13 +47,17 @@ async function enroll(name) {
     lines:sent=>sent.flatMap(m=>m.message.split('\n').slice(1)),
     saved:()=>read(key),
     cool:()=>{const saved=read(key);saved.cooldowns={};set(key,saved);},
+    // Age every cooldown past the 10-minute window, as if that much time had passed.
+    expire:()=>{const saved=read(key);for(const id of Object.keys(saved.cooldowns||{}))saved.cooldowns[id]-=11*60000;set(key,saved);},
     state:()=>read('storage/'+id+'.json'),
     setState:value=>set('storage/'+id+'.json',value),
   };
 }
+const sweep=async()=>{objects.delete('notifications/sweep.json');let work;await worker.scheduled(null,env,{waitUntil:p=>{work=p;}});await work;};
 const settings=data=>call('/api/notifications','PATCH',{enabled:true,recoveries:true,...data});
 
 try {
+  let before;
   // Settings: defaults, validation, and a body with every field (well inside the 1 KiB settings limit).
   const defaults=await (await call('/api/notifications')).json();
   assert.deepEqual([defaults.storagePoolAlerts,defaults.storageVdevAlerts,defaults.storageErrorAlerts,defaults.storageScrubErrorAlerts,defaults.storageScrubAgeAlerts,defaults.storageCapacityAlerts],[true,true,true,true,true,true]);
@@ -113,13 +118,19 @@ try {
   const mirror=vdev(pruned,'mirror-0');mirror.children=mirror.children.filter(c=>c.name!=='disk2');pruned.storage.pools[0].vdevsTruncated=true;
   assert.deepEqual(await nas.send(pruned),[]);
   assert.ok(nas.saved().delivered['zfs:vdev:zfstest/disk2']);
-  // Recovery.
+  // Recovery needs a second consecutive report (flap protection); both alerts stay on record until then.
+  assert.deepEqual(await nas.send(fixture('captured-scenarios/07-resilver-finished')),[],'one clean report is not yet a recovery');
+  assert.ok(nas.saved().delivered['zfs:pool:zfstest'] && nas.saved().delivered['zfs:vdev:zfstest/disk2'],'held alerts stay on record');
+  nas.unblock();before=requests.length;await sweep();
+  assert.deepEqual(requests.slice(before),[],'a sweep re-reading the same report is not a second report');
+  assert.ok(read('notifications/sweep.json').pending>=1,'a held recovery is reported as pending');
   sent=await nas.send(fixture('captured-scenarios/07-resilver-finished'));
   assert.deepEqual(nas.lines(sent).sort(),['Cleared: zfstest/disk2: vdev no longer reported; check the dashboard','Cleared: zfstest: pool is ONLINE again']);
   assert.equal(sent[0].priority,3,'recoveries only use default priority');
   await settings({priority:4});
 
   // Maintenance pauses storage alerts like any other; they arrive once it ends.
+  nas.expire();  // A vdev re-alert inside the cooldown would wait (flap protection, tested below).
   assert.equal((await call('/api/hosts/'+nas.id+'/maintenance','POST',{minutes:15})).status,200);
   assert.deepEqual(await nas.send(fixture('captured-scenarios/05-degraded-offline')),[]);
   assert.equal((await call('/api/hosts/'+nas.id+'/maintenance','POST',{minutes:0})).status,200);
@@ -133,8 +144,7 @@ try {
 
   // Stale at 180 s; the recovery names the storage agent.
   const snapshot=read('snapshots/'+nas.id+'.json');snapshot.receivedAt=iso(Date.now()-200000);set('snapshots/'+nas.id+'.json',snapshot);
-  const sweep=async()=>{objects.delete('notifications/sweep.json');let work;await worker.scheduled(null,env,{waitUntil:p=>{work=p;}});await work;};
-  nas.unblock();let before=requests.length;await sweep();
+  nas.unblock();before=requests.length;await sweep();
   assert.deepEqual(requests.slice(before).map(m=>m.message),['nas\nAlert: No storage agent report for more than three minutes']);
   assert.ok(nas.saved().delivered['zfs:pool:zfstest'],'a stale host keeps its pool alerts');
   sent=await nas.send(fixture('captured-scenarios/05-degraded-offline'));
@@ -143,17 +153,24 @@ try {
   // Hot spares, log, cache and special vdevs (captured on a second host).
   const spare=await enroll('nas-classes');
   assert.deepEqual(await spare.send(fixture('captured-classes/01-all-healthy')),[],'an AVAIL spare is healthy');
-  sent=await spare.send(fixture('captured-classes/03-cache-offline'));
+  // Each capture is reported twice: a vdev recovery needs a second consecutive report.
+  const settle=async name=>[...await spare.send(fixture('captured-classes/'+name)),...await spare.send(fixture('captured-classes/'+name))];
+  sent=await settle('03-cache-offline');
   assert.deepEqual(spare.lines(sent),['Alert: zfstest2/cache1 (cache): OFFLINE'],'a cache device alerts while the pool is ONLINE');
   assert.equal(sent[0].priority,4);
-  sent=await spare.send(fixture('captured-classes/02-log-offline'));
+  sent=await settle('02-log-offline');
   assert.deepEqual(spare.lines(sent),['Alert: zfstest2: pool is DEGRADED','Alert: zfstest2/log1 (log): OFFLINE','Cleared: zfstest2/cache1: vdev is healthy again']);
-  sent=await spare.send(fixture('captured-classes/06-special-member-offline'));
+  sent=await settle('06-special-member-offline');
   assert.deepEqual(spare.lines(sent),['Alert: zfstest2/sp2 (special): OFFLINE','Cleared: zfstest2/log1: vdev is healthy again']);
-  sent=await spare.send(fixture('captured-classes/04-spare-inuse-resilvering'));
+  sent=await settle('04-spare-inuse-resilvering');
   assert.deepEqual(spare.lines(sent),['Alert: zfstest2/d2: OFFLINE','Cleared: zfstest2/sp2: vdev is healthy again'],'the in-use spare is ONLINE and not an alert');
-  sent=await spare.send(fixture('captured-classes/05-spare-inuse-resilver-finished'));
+  sent=await settle('05-spare-inuse-resilver-finished');
   assert.deepEqual(sent,[]);
+  // A spare that comes back as AVAIL is healthy again, not "now AVAIL".
+  const lostSpare=fixture('captured-classes/01-all-healthy');vdev(lostSpare,'spare1').state='UNAVAIL';
+  assert.ok(spare.lines([...await spare.send(lostSpare),...await spare.send(lostSpare)]).includes('Alert: zfstest2/spare1 (spare): UNAVAIL'));
+  spare.expire();
+  assert.ok(spare.lines(await settle('01-all-healthy')).includes('Cleared: zfstest2/spare1: vdev is healthy again'),'an AVAIL spare is a recovery');
 
   // Capacity: 80% warning, 90% high, with two points of hysteresis and the cooldown.
   const cap=await enroll('nas-capacity');
@@ -245,6 +262,94 @@ try {
   assert.equal(kept.length,1+16,'at most 16 absent pools are remembered');
   // zfstest (absent since two reports ago) is the most recently seen absent pool.
   assert.deepEqual(kept,['tank','zfstest',...Array.from({length:15},(_,i)=>'old'+i)],'the most recently seen are kept');
+
+  // A change held by the cooldown keeps the delivered alert on record (text and counters).
+  // 16 -> 20 inside the cooldown -> 5 after it: the 5 is a reset against 16, not a new alert.
+  const held=await enroll('nas-held');
+  const errs=n=>{const r=fixture('captured-scenarios/08-checksum-errors-after-scrub');vdev(r,'disk3').checksum=n;return r;};
+  const disk3='zfs:errors:zfstest/disk3', text16='zfstest/disk3: read 0, write 0, checksum 16 error(s)';
+  assert.ok(held.lines(await held.send(errs(16))).includes('Alert: '+text16));
+  assert.deepEqual(await held.send(errs(20)),[],'an increase inside the cooldown waits');
+  assert.equal(held.saved().delivered[disk3],text16,'the delivered alert stays on record');
+  assert.deepEqual(held.saved().storageCounters[disk3],{read:0,write:0,checksum:16},'with the counters it was delivered with');
+  held.expire();
+  assert.deepEqual(await held.send(errs(5)),[],'a reset after a held increase is quiet');
+  assert.equal(held.saved().delivered[disk3],'zfstest/disk3: read 0, write 0, checksum 5 error(s)');
+  // A later increase over the reset baseline alerts (the cooldown has passed).
+  assert.deepEqual(held.lines(await held.send(errs(20))),['Alert: zfstest/disk3: read 0, write 0, checksum 20 error(s)']);
+  // 92 -> 85 inside the cooldown -> 70: the high alert stays on record and its recovery arrives.
+  const fill=await enroll('nas-fill');
+  const level=percent=>withCapacity(fixture('synthetic/capacity-92'),percent);
+  assert.deepEqual(fill.lines(await fill.send(level(92))),['Alert: tank: capacity reached 90% (high)']);
+  assert.deepEqual(await fill.send(level(85)),[],'the change to a warning waits for the cooldown');
+  assert.equal(fill.saved().delivered['zfs:capacity:tank'],'tank: capacity reached 90% (high)','the high alert stays on record');
+  assert.deepEqual(fill.lines(await fill.send(level(70))),['Cleared: tank: capacity back below the alert threshold'],'the recovery is not lost');
+  fill.expire();
+  assert.deepEqual(await fill.send(level(70)),[],'and is not repeated');
+  // Changing only the high threshold does not re-send a warning that names the warning threshold.
+  assert.deepEqual(fill.lines(await fill.send(level(85))),['Alert: tank: capacity reached 80% (warning)']);
+  await settings({storageCapacityHigh:95});
+  assert.deepEqual(await fill.send(level(85)),[],'a high-threshold change keeps the warning');
+  assert.equal(fill.saved().delivered['zfs:capacity:tank'],'tank: capacity reached 80% (warning)');
+  // Lowering high below the current usage escalates at once (the threshold change clears the cooldown).
+  await settings({storageCapacityHigh:85});
+  assert.deepEqual(fill.lines(await fill.send(level(85))),['Alert: tank: capacity reached 85% (high)']);
+  await settings({storageCapacityWarn:75});
+  assert.deepEqual(await fill.send(level(85)),[],'a warning-threshold change keeps the high alert');
+  await settings({storageCapacityWarn:80,storageCapacityHigh:90});
+
+  // A group vdev leaving UNAVAIL for DEGRADED is not "healthy again".
+  const group=await enroll('nas-group');
+  const degraded=fixture('captured-scenarios/05-degraded-offline');
+  const unavail=clone(degraded);vdev(unavail,'mirror-0').state='UNAVAIL';
+  for(const child of vdev(unavail,'mirror-0').children)child.state=child.name==='disk2'?'OFFLINE':'FAULTED';
+  assert.ok(group.lines(await group.send(unavail)).includes('Alert: zfstest/mirror-0: UNAVAIL'));
+  assert.deepEqual(await group.send(degraded),[],'the first report without the alerts holds them');
+  assert.deepEqual(group.lines(await group.send(degraded)).sort(),['Cleared: zfstest/disk1: vdev is healthy again','Cleared: zfstest/mirror-0: now DEGRADED; see its member devices']);
+
+  // Flap protection: a disk alternating ONLINE/FAULTED every report sends at most one message
+  // per cooldown window, and its alert stays on record throughout. The pool alert is immediate.
+  const flap=await enroll('nas-flap');
+  const healthy=fixture('captured-scenarios/04-scrub-finished');
+  const faulted=clone(healthy);faulted.storage.pools[0].state='DEGRADED';vdev(faulted,'mirror-0').state='DEGRADED';vdev(faulted,'disk1').state='FAULTED';
+  assert.deepEqual(await flap.send(healthy),[]);
+  for(let window=0;window<3;window++) {
+    const messages=[];
+    for(let report=0;report<8;report++) {
+      messages.push(...await flap.send(report%2?healthy:faulted));
+      assert.ok(flap.saved().delivered['zfs:vdev:zfstest/disk1'],'window '+window+' report '+report+': the alert stays on record');
+    }
+    assert.ok(messages.length<=1,'window '+window+': '+messages.length+' messages');
+    if(window===0)assert.deepEqual(flap.lines(messages),['Alert: zfstest: pool is DEGRADED','Alert: zfstest/disk1: FAULTED'],'the first fault alerts at once');
+    else assert.deepEqual(messages,[],'still flapping: the alert was never cleared, so nothing repeats');
+    flap.expire();
+  }
+  // Two consecutive clean reports are a recovery.
+  assert.deepEqual(await flap.send(faulted),[]);
+  assert.deepEqual(await flap.send(healthy),[]);
+  assert.deepEqual(flap.lines(await flap.send(healthy)).sort(),['Cleared: zfstest/disk1: vdev is healthy again','Cleared: zfstest: pool is ONLINE again']);
+  // A released recovery whose publish fails is retried on the next sweep, not held for two more reports.
+  assert.deepEqual(flap.lines(await flap.send(faulted)),['Alert: zfstest: pool is DEGRADED','Alert: zfstest/disk1: FAULTED']);
+  assert.deepEqual(await flap.send(healthy),[]);
+  failNext=1;assert.deepEqual(await flap.send(healthy),[],'the publish fails');
+  assert.ok(flap.saved().delivered['zfs:vdev:zfstest/disk1']);
+  flap.unblock();before=requests.length;await sweep();
+  assert.deepEqual(flap.lines(requests.slice(before).filter(m=>m.message.startsWith('nas-flap\n'))).sort(),['Cleared: zfstest/disk1: vdev is healthy again','Cleared: zfstest: pool is ONLINE again'],'the retry sends the recovery');
+  flap.expire();
+  // A slower flap (two reports each way): the fault alerts once, and its quick return
+  // inside the cooldown re-alerts the pool at once but holds the vdev alert for the window.
+  assert.deepEqual(flap.lines(await flap.send(faulted)),['Alert: zfstest: pool is DEGRADED','Alert: zfstest/disk1: FAULTED']);
+  assert.deepEqual(await flap.send(healthy),[]);
+  assert.deepEqual(flap.lines(await flap.send(healthy)).sort(),['Cleared: zfstest/disk1: vdev is healthy again','Cleared: zfstest: pool is ONLINE again']);
+  assert.deepEqual(flap.lines(await flap.send(faulted)),['Alert: zfstest: pool is DEGRADED'],'the pool alert is never delayed');
+  flap.expire();
+  assert.deepEqual(flap.lines(await flap.send(faulted)),['Alert: zfstest/disk1: FAULTED']);
+  // A FAULTED -> REMOVED change inside the window waits too, keeping the FAULTED alert on record.
+  const removed=clone(faulted);vdev(removed,'disk1').state='REMOVED';
+  assert.deepEqual(await flap.send(removed),[]);
+  assert.equal(flap.saved().delivered['zfs:vdev:zfstest/disk1'],'zfstest/disk1: FAULTED');
+  const failedPool=clone(removed);failedPool.storage.pools[0].state='UNAVAIL';
+  assert.deepEqual(flap.lines(await flap.send(failedPool)),['Alert: zfstest: pool is UNAVAIL'],'a pool state change is immediate');
 
   // Report alerts off: the agent error is not sent.
   await settings({hostReports:false});
