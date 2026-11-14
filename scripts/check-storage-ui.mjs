@@ -85,10 +85,12 @@ assert.ok(html.includes('id="storage-status" class="storage-status" role="status
 // Board helpers, evaluated from board.js itself.
 const slice=(from,to)=>{const start=board.indexOf(from),end=board.indexOf(to,start);assert.ok(start>=0 && end>start,from);return board.slice(start,end);};
 const helpers=vm.createContext({Date,Math,Number,String,Object});
-vm.runInContext([await readFile('worker/versions.js','utf8'),'let lastError="", availableStorageAgentVersion="0.2.0";',
+// A minimal node() stand-in so element-building helpers run without a DOM.
+const stubNode='function node(tag,className="",text){const el={tag,className,textContent:text,children:[],title:"",classList:{contains:c=>el.className.split(" ").includes(c)},append(...kids){el.children.push(...kids);}};return el;}';
+vm.runInContext([await readFile('worker/versions.js','utf8'),'let lastError="", availableStorageAgentVersion="0.2.0";',stubNode,
   slice('const age = iso','function node('),slice('function staleAfterSeconds','function groupMatches('),slice('function storageAgentInfo(','function collectorInfo('),
   slice('function reportDate(','function renderResourceOverview('),slice('// ZFS storage hosts. Issues come','function vdevItem('),
-  'this.api={storageEngineText,stateClass,scanProgress,lastScrubText,storageAgentInfo,poolAlerts,storageAlerts,deviceErrorText,poolStateClass,poolRank,alertText};'].join('\n'),helpers);
+  'this.api={storageEngineText,stateClass,scanProgress,lastScrubText,storageAgentInfo,poolAlerts,storageAlerts,deviceErrorText,poolStateClass,poolRank,alertText,poolBadge};'].join('\n'),helpers);
 const ui=helpers.api;
 assert.equal(ui.storageEngineText({storage:{state:'ok',zfsVersion:'2.4.1-1'}}),'OpenZFS 2.4.1-1');
 assert.equal(ui.storageEngineText({storage:{state:'error',zfsVersion:null}}),'ZFS status unavailable');
@@ -132,12 +134,22 @@ assert.equal(ui.poolStateClass(healthy,[{rule:'scrub-age'}]),'warn','any open is
 assert.equal(ui.poolStateClass(healthy,[]),'good');
 assert.equal(ui.poolStateClass(faulted,[]),'warn','DEGRADED keeps its own class');
 assert.equal(ui.poolStateClass({...healthy,state:'FAULTED'},[]),'bad');
+// The warning ONLINE badge names its reason for screen readers; other badges carry only the state.
+const badge=ui.poolBadge(coldpool,[]);
+assert.equal(badge.className,'pill warn');assert.equal(badge.textContent,'ONLINE');
+assert.deepEqual(clone(badge.children.map(c=>[c.className,c.textContent])),[['sr-only',', with open storage issues']],'warning ONLINE badge explains itself');
+assert.deepEqual(clone(ui.poolBadge(healthy,[]).children),[],'healthy badge has no extra text');
+assert.deepEqual(clone(ui.poolBadge(faulted,[]).children),[],'DEGRADED speaks for itself');
+assert.equal(ui.poolBadge(healthy,[{rule:'capacity'}],' · last known').textContent,'ONLINE · last known');
 // Severity order: not ONLINE, data errors, device errors, capacity, scrub issues, healthy.
 const ranked=[[healthy,[],'healthy'],[healthy,[{rule:'scrub-age'}],'scrub'],[healthy,[{rule:'capacity'}],'capacity'],[coldpool,[],'devices'],
   [healthy,[{rule:'data-errors'}],'data'],[faulted,[],'degraded'],[null,[{rule:'agent'}],'agent']];
 assert.deepEqual([...ranked].sort((a,b)=>ui.poolRank(a[0],a[1])-ui.poolRank(b[0],b[1])).map(r=>r[2]),['degraded','agent','data','devices','capacity','scrub','healthy']);
 assert.ok(ui.poolRank(healthy,[{rule:'capacity'},{rule:'data-errors'},{rule:'scrub-age'}])<ui.poolRank(coldpool,[]),'the worst issue decides');
-assert.deepEqual(clone(ui.poolAlerts({kind:'storage',storageAlerts:[{pool:'p',rule:'scrub-age'},{pool:'p',rule:'capacity'},{pool:'p',rule:'errors'},{pool:'p',rule:'data-errors'}]},'p').map(a=>a.rule)),['data-errors','errors','capacity','scrub-age'],'issues list most severe first');
+// A scrub that found or repaired errors ranks with device errors, above capacity and overdue scrubs.
+assert.equal(ui.poolRank(healthy,[{rule:'scrub-errors'}]),ui.poolRank(coldpool,[]),'scrub-found errors rank with device errors');
+assert.ok(ui.poolRank(healthy,[{rule:'scrub-errors'}])<ui.poolRank(healthy,[{rule:'capacity'}]),'scrub-found errors rank above capacity');
+assert.deepEqual(clone(ui.poolAlerts({kind:'storage',storageAlerts:[{pool:'p',rule:'scrub-age'},{pool:'p',rule:'capacity'},{pool:'p',rule:'scrub-errors'},{pool:'p',rule:'errors'},{pool:'p',rule:'data-errors'}]},'p').map(a=>a.rule)),['data-errors','scrub-errors','errors','capacity','scrub-age'],'issues list most severe first');
 // Times: readable UTC in alert text (ntfy), the viewer's own format on the dashboard; never raw ISO.
 assert.equal(rules.api.storageTimeText('2026-11-09T06:27:00Z'),'9 Nov 2026, 06:27 UTC');
 const scrubbed=fixturePool('synthetic/checksum-errors');scrubbed.name='coldpool';scrubbed.vdevs[0].name='coldpool';

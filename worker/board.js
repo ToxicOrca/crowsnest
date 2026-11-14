@@ -801,12 +801,19 @@ function poolStateClass(pool,alerts) {
   const base=stateClass(pool.state);
   return base==='good' && (alerts.length || deviceErrors(pool).length)?'warn':base;
 }
-// Pool order: not ONLINE (or unknown), data errors, device errors, capacity, scrub issues, healthy.
-const POOL_RANKS={agent:0,pool:0,'data-errors':1,errors:2,vdev:2,capacity:3,'scrub-errors':4,'scrub-age':4};
+// Pool order: not ONLINE (or unknown), data errors, device errors or a scrub that found errors,
+// capacity, overdue scrubs, healthy.
+const POOL_RANKS={agent:0,pool:0,'data-errors':1,errors:2,vdev:2,'scrub-errors':2,capacity:3,'scrub-age':4};
 function poolRank(pool,alerts) {
   if(!pool)return alerts.length?0:6;
   if(pool.state!=='ONLINE')return 0;
   return Math.min(deviceErrors(pool).length?2:5,...alerts.map(a=>POOL_RANKS[a.rule]??4));
+}
+// The state badge; a warning-colored ONLINE also says why to screen readers (a span cannot carry an aria-label).
+function poolBadge(pool,alerts,suffix='') {
+  const badge=node('span','pill '+poolStateClass(pool,alerts),pool.state+suffix);
+  if(pool.state==='ONLINE' && badge.classList.contains('warn')){badge.title='ONLINE, with open storage issues';badge.append(node('span','sr-only',', with open storage issues'));}
+  return badge;
 }
 // Issue text names times in UTC for ntfy; the dashboard shows them in the viewer's format.
 function alertText(alert) {
@@ -846,9 +853,7 @@ function poolCard(host,pool,index,lastKnown) {
   const alerts=poolAlerts(host,pool.name), key=host.id+':'+pool.name, titleId='pool-title-'+index;
   const card=node('article','pool-card'+(alerts.length?' pool-attention':''));card.setAttribute('aria-labelledby',titleId);
   const heading=node('div','pool-heading'), title=node('h4','',pool.name);title.id=titleId;
-  const badge=node('span','pill '+poolStateClass(pool,alerts),pool.state+(lastKnown?' · last known':''));
-  if(badge.className.endsWith('warn') && pool.state==='ONLINE')badge.title='ONLINE, with open storage issues';
-  heading.append(title,badge);
+  heading.append(title,poolBadge(pool,alerts,lastKnown?' · last known':''));
   card.append(heading);
   const capacity=alerts.find(a=>a.rule==='capacity'), cap=pool.capacityPercent;
   const meter=node('div','capacity');
@@ -913,7 +918,7 @@ function renderPoolRows(rows,total) {
     name.append(link,node('span','row-host',r.host.name+(r.stale?' · last known status':'')));
     // Narrow screens drop the capacity and issue columns; this line carries them.
     name.append(node('span','mobile-details',(r.pool && r.pool.capacityPercent!==null?r.pool.capacityPercent+'% used · ':'')+(r.alerts.length?r.alerts.length+' issue'+(r.alerts.length===1?'':'s')+': '+alertText(r.alerts[0]):'No issues')));
-    const state=node('td');if(r.pool)state.append(node('span','pill '+poolStateClass(r.pool,r.alerts),r.pool.state));else state.append(node('span','pill bad','Unknown'));
+    const state=node('td');if(r.pool)state.append(poolBadge(r.pool,r.alerts));else state.append(node('span','pill bad','Unknown'));
     const cap=node('td','pool-capacity desktop-detail');
     if(r.pool && r.pool.capacityPercent!==null){const alert=r.alerts.find(a=>a.rule==='capacity'),bar=node('div','capacity-bar'+(alert?' '+(alert.severity==='high'?'bad':'warn'):''));bar.setAttribute('aria-hidden','true');const fill=node('span');fill.style.width=r.pool.capacityPercent+'%';bar.append(fill);cap.append(node('span','',r.pool.capacityPercent+'%'),bar);}
     else cap.textContent='—';
