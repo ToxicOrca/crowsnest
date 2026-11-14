@@ -10,6 +10,8 @@
 !worker/**
 !collector/
 !collector/**
+!storage-agent/
+!storage-agent/**
 !server/
 !server/**
 **/node_modules
